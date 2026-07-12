@@ -1,0 +1,3 @@
+"""
+IBIS Auto Downloader package
+"""

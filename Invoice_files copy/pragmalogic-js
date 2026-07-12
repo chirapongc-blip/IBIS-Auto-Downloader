@@ -1,0 +1,465 @@
+/* Minification failed. Returning unminified contents.
+(292,9-10): run-time error JS1010: Expected identifier: .
+(292,9-10): run-time error JS1195: Expected expression: .
+ */
+window.PreferenceManager = {
+
+    url: null,
+
+    setup: function (url) {
+        this.url = url;
+    },
+
+    submit: function (request, callback) {
+        $.ajax({
+            type: "POST",
+            url: this.url,
+            data: JSON.stringify(request),
+            contentType: "application/json",
+            dataType: "json",
+            success: function (input) {
+                if (callback) {
+                    callback(input);
+                }
+            },
+            error: function (input) {
+                console.log(input);
+            }
+        });
+    },
+
+    put: function (name, value, callback) {
+        var request = { Name: name, Value: value };
+        this.submit(request, callback);
+    },
+
+    restoreDefaults: function (callback) {
+        var request = { Restore: true };
+        this.submit(request, callback);
+    },
+};;
+window.UploadManager = {
+
+    config: null,
+
+    init: function (config) {
+        this.config = config;
+        var self = this;
+        this.config.input.on("change", function () {
+            var file = self.config.input[0].files[0];
+            self.submit(file, function (uploadSuccess) 
+            { 
+                if(uploadSuccess) {
+                    window.location.reload(true);
+                }
+                else {
+                    self.config.input[0].value = '';
+                    config.message.innerHTML = "Upload Failed.";
+                } 
+            });
+        });
+    },
+
+    showopen: function () {
+        this.config.input.click();
+    },
+
+    submit: function (file, callback) {
+        var request = new FormData();
+        request.append("file", file);
+        request.append("id", this.config.id);
+
+        $.ajax({
+            type: "POST",
+            url: this.config.url,
+            data: request,
+            contentType: false,
+            processData: false,
+            success: function (input) {
+                if (callback) {
+                    callback(input);
+                }
+            },
+            error: function (input) {
+                console.log(input);
+            }
+        });
+    },
+};;
+function registerGridResize() {
+    window.addEventListener('resize', function (evt) {
+        if (!ASPxClientUtils.androidPlatform)
+            return;
+        var activeElement = document.activeElement;
+        if (activeElement && (activeElement.tagName === "INPUT" || activeElement.tagName === "TEXTAREA") && activeElement.scrollIntoViewIfNeeded)
+            window.setTimeout(function () { activeElement.scrollIntoViewIfNeeded(); }, 0);
+    });
+
+    ASPxClientControl.GetControlCollection().ControlsInitialized.AddHandler(function (s, e) {
+        UpdateGridHeight();
+    });
+    ASPxClientControl.GetControlCollection().BrowserWindowResized.AddHandler(function (s, e) {
+        UpdateGridHeight();
+    });
+}
+
+function refreshGrid(grid) {
+    grid.SetHeight(0);
+    var containerHeight = ASPxClientUtils.GetDocumentClientHeight();
+    if (document.body.scrollHeight > containerHeight) {
+        containerHeight = document.body.scrollHeight;
+    }
+    grid.SetHeight(containerHeight);
+}
+
+
+function onSearchSuccess(data) {
+    if (data.RedirectUrl) {
+        window.location.href = data.RedirectUrl;
+    }
+    else {
+        $('#modalContainer').html(data);
+        var dataTable = $("#searchResultTable").DataTable({
+            scrollY: "200px",
+            scrollX: true,
+            scrollCollapse: true,
+            //sorting: false,
+        });
+        $('#searchResultModal').on('shown.bs.modal', function (e) {
+            dataTable.columns.adjust();
+        });
+        $('#searchResultModal').modal('show');
+    }
+}
+
+function onSearchFailure(data) {
+    $('#modalContainer').html(data);
+    $('#searchResultModal').modal('show');
+}
+
+function smartBitsToBytes(bits) {
+    if (bits < 8)
+        return bits + " bits";
+
+    return smartBytes(bits / 8);
+}
+
+function smartBytes(bytes) {
+
+    const kib = 1024;
+    const mib = 1048576;
+    const gib = 1073741824;
+    const tib = 1099511627776;
+
+    if (bytes <= kib * 8)
+        return bytes + " bytes";
+    if (bytes < mib)
+        return (bytes / kib).toFixed(2) + " KiB";
+    if (bytes < gib)
+        return (bytes / mib).toFixed(2) + " MiB";
+    if (bytes < tib)
+        return (bytes / gib).toFixed(2) + " GiB";
+
+    return (bytes / tib).toFixed(2) + " TiB";
+}
+
+function smartBitsToBytesBase1000(bits) {
+    if (bits < 8)
+        return bits + " bits";
+
+    return smartBytesBase1000(bits / 8);
+}
+
+function smartBytesBase1000(bytes) {
+
+    const kb = 1000;
+    const mb = 1000000;
+    const gb = 1000000000;
+    const tb = 1000000000000;
+
+    if (bytes <= kb * 8)
+        return bytes + " bytes";
+    if (bytes < mb)
+        return (bytes / kb).toFixed(2) + " KB";
+    if (bytes < gb)
+        return (bytes / mb).toFixed(2) + " MB";
+    if (bytes < tb)
+        return (bytes / gb).toFixed(2) + " GB";
+
+    return (bytes / tb).toFixed(2) + " TB";
+}
+
+function smartBits(input) {
+
+    const k = 1000;
+    const m = 1000000;
+    const g = 1000000000;
+    const t = 1000000000000;
+
+    // https://nl.wikipedia.org/wiki/Kilobit_per_seconde
+    if (input < k)
+        return input + " bit";
+    if (input < m)
+        return (input / k).toFixed(2) + " kbit";
+    if (input < g)
+        return (input / m).toFixed(2) + " Mbit";
+    if (input < t)
+        return (input / g).toFixed(2) + " Gbit";
+
+    return (input / t).toFixed(2) + " Tbit";
+}
+
+function formatSecondsToTimeString(seconds, short) {
+    let minutes = Math.floor(seconds / 60);
+    let remainingSeconds = seconds % 60;
+
+    let minuteString = short ? "m" : (minutes === 1) ? "minute" : "minutes";
+    let secondString = short ? "s" : (remainingSeconds === 1) ? "second" : "seconds";
+
+    return short ? `${minutes}${minuteString}${remainingSeconds}${secondString}` : `${minutes} ${minuteString}, ${remainingSeconds} ${secondString}`;
+}
+
+function formatNumberToLocaleString(value, numberOfDecimals) {
+    return value.toLocaleString(undefined, {
+        minimumFractionDigits: numberOfDecimals,
+        maximumFractionDigits: numberOfDecimals
+    });
+};
+var updateSimpleUtcServerTimeClockDiff = 0;
+
+
+function updateSimpleUtcServerTimeClock() {
+
+    var dClient = new Date();
+    var dClientEpochTime = dClient.getTime() / 1000;
+    var dServerEpochTime = dClientEpochTime + updateSimpleUtcServerTimeClockDiff;
+
+    var d = new Date(dServerEpochTime * 1000);
+
+    var h = d.getUTCHours();
+    var m = d.getUTCMinutes();
+    var s = d.getUTCSeconds();
+
+    if (h < 10) { h = "0" + h; }
+    if (m < 10) { m = "0" + m; }
+
+    $('#simpleUtcServerTimeClock').html(h + ":" + m + " UTC");
+
+    setTimeout(updateSimpleUtcServerTimeClock, 1000);
+}
+
+
+function InitSimpleUtcServerTimeClock(serverEpochTime) {
+
+    var dServerEpochTime = new Date(serverEpochTime);
+    var dClient = new Date();
+    var dClientEpochTime = dClient.getTime() / 1000;
+
+    updateSimpleUtcServerTimeClockDiff = dServerEpochTime - dClientEpochTime;
+
+    updateSimpleUtcServerTimeClock();
+};
+/*!
+ * https://www.mojotech.com/blog/responsive-dynamic-height-sticky-footers/
+ */
+var bumpIt = function () {
+    $('body').css('margin-bottom', $('.footer').height());
+},
+    didResize = false;
+
+bumpIt();
+
+$(window).resize(function () {
+    didResize = true;
+});
+
+setInterval(function () {
+    if (didResize) {
+        didResize = false;
+        bumpIt();
+    }
+}, 250);;
+/*!
+ * JavaScript Cookie v2.2.1
+ * https://github.com/js-cookie/js-cookie
+ *
+ * Copyright 2006, 2015 Klaus Hartl & Fagner Brack
+ * Released under the MIT license
+ */
+;(function (factory) {
+	var registeredInModuleLoader;
+	if (typeof define === 'function' && define.amd) {
+		define(factory);
+		registeredInModuleLoader = true;
+	}
+	if (typeof exports === 'object') {
+		module.exports = factory();
+		registeredInModuleLoader = true;
+	}
+	if (!registeredInModuleLoader) {
+		var OldCookies = window.Cookies;
+		var api = window.Cookies = factory();
+		api.noConflict = function () {
+			window.Cookies = OldCookies;
+			return api;
+		};
+	}
+}(function () {
+	function extend () {
+		var i = 0;
+		var result = {};
+		for (; i < arguments.length; i++) {
+			var attributes = arguments[ i ];
+			for (var key in attributes) {
+				result[key] = attributes[key];
+			}
+		}
+		return result;
+	}
+
+	function decode (s) {
+		return s.replace(/(%[0-9A-Z]{2})+/g, decodeURIComponent);
+	}
+
+	function init (converter) {
+		function api() {}
+
+		function set (key, value, attributes) {
+			if (typeof document === 'undefined') {
+				return;
+			}
+
+			attributes = extend({
+				path: '/'
+			}, api.defaults, attributes);
+
+			if (typeof attributes.expires === 'number') {
+				attributes.expires = new Date(new Date() * 1 + attributes.expires * 864e+5);
+			}
+
+			// We're using "expires" because "max-age" is not supported by IE
+			attributes.expires = attributes.expires ? attributes.expires.toUTCString() : '';
+
+			try {
+				var result = JSON.stringify(value);
+				if (/^[\{\[]/.test(result)) {
+					value = result;
+				}
+			} catch (e) {}
+
+			value = converter.write ?
+				converter.write(value, key) :
+				encodeURIComponent(String(value))
+					.replace(/%(23|24|26|2B|3A|3C|3E|3D|2F|3F|40|5B|5D|5E|60|7B|7D|7C)/g, decodeURIComponent);
+
+			key = encodeURIComponent(String(key))
+				.replace(/%(23|24|26|2B|5E|60|7C)/g, decodeURIComponent)
+				.replace(/[\(\)]/g, escape);
+
+			var stringifiedAttributes = '';
+			for (var attributeName in attributes) {
+				if (!attributes[attributeName]) {
+					continue;
+				}
+				stringifiedAttributes += '; ' + attributeName;
+				if (attributes[attributeName] === true) {
+					continue;
+				}
+
+				// Considers RFC 6265 section 5.2:
+				// ...
+				// 3.  If the remaining unparsed-attributes contains a %x3B (";")
+				//     character:
+				// Consume the characters of the unparsed-attributes up to,
+				// not including, the first %x3B (";") character.
+				// ...
+				stringifiedAttributes += '=' + attributes[attributeName].split(';')[0];
+			}
+
+			return (document.cookie = key + '=' + value + stringifiedAttributes);
+		}
+
+		function get (key, json) {
+			if (typeof document === 'undefined') {
+				return;
+			}
+
+			var jar = {};
+			// To prevent the for loop in the first place assign an empty array
+			// in case there are no cookies at all.
+			var cookies = document.cookie ? document.cookie.split('; ') : [];
+			var i = 0;
+
+			for (; i < cookies.length; i++) {
+				var parts = cookies[i].split('=');
+				var cookie = parts.slice(1).join('=');
+
+				if (!json && cookie.charAt(0) === '"') {
+					cookie = cookie.slice(1, -1);
+				}
+
+				try {
+					var name = decode(parts[0]);
+					cookie = (converter.read || converter)(cookie, name) ||
+						decode(cookie);
+
+					if (json) {
+						try {
+							cookie = JSON.parse(cookie);
+						} catch (e) {}
+					}
+
+					jar[name] = cookie;
+
+					if (key === name) {
+						break;
+					}
+				} catch (e) {}
+			}
+
+			return key ? jar[key] : jar;
+		}
+
+		api.set = set;
+		api.get = function (key) {
+			return get(key, false /* read as raw */);
+		};
+		api.getJSON = function (key) {
+			return get(key, true /* read as json */);
+		};
+		api.remove = function (key, attributes) {
+			set(key, '', extend(attributes, {
+				expires: -1
+			}));
+		};
+
+		api.defaults = {};
+
+		api.withConverter = init;
+
+		return api;
+	}
+
+	return init(function () {});
+}));
+;
+document.addEventListener('submit', function (e) {
+    var form = e.target;
+    setTimeout(function () {
+        // Standard HTML submit buttons
+        form.querySelectorAll('[type="submit"]').forEach(function (btn) {
+            btn.disabled = true;
+        });
+        // DevExtreme buttons with useSubmitBehavior: true contain a .dx-button-submit-input
+        // and must be disabled via the widget API, since programmatic .click() bypasses
+        // the disabled attribute on the underlying input element.
+        if (typeof $ !== 'undefined' && $.fn.dxButton) {
+            document.querySelectorAll('.dx-button').forEach(function (el) {
+                if (el.querySelector('.dx-button-submit-input')) {
+                    $(el).dxButton('option', 'disabled', true);
+                }
+            });
+        }
+    }, 0);
+});
+;
