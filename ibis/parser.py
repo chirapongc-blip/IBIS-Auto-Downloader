@@ -1,5 +1,5 @@
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urljoin, urlparse
 import re
 
 
@@ -17,14 +17,44 @@ def extract_invoice_links(html: str, base_url: str):
         if "DownloadARExport.aspx" not in href:
             continue
 
+        url = urljoin(base_url, href)
+        metadata = _extract_download_metadata(url)
+        filename = _extract_filename_from_row(a)
+
         links.append(
             {
-                "url": urljoin(base_url, href),
+                "url": url,
                 "title": a.get("title", ""),
+                "invoice_id": metadata.get("invoice_id"),
+                "billing_period": metadata.get("billing_period"),
+                "filename": filename,
             }
         )
 
     return links
+
+
+def _extract_download_metadata(url: str):
+    query = dict(
+        (key.strip(), value.strip())
+        for key, value in parse_qsl(urlparse(url).query, keep_blank_values=True)
+    )
+
+    return {
+        "invoice_id": query.get("InvoiceID") or None,
+        "billing_period": query.get("BillingPeriod") or None,
+    }
+
+
+def _extract_filename_from_row(anchor):
+    for row in anchor.find_parents("tr"):
+        for candidate in row.find_all("a", href=True):
+            href = candidate.get("href", "")
+            text = candidate.get_text(strip=True)
+            if "RetrieveInvoice.aspx" in href and text:
+                return text
+
+    return None
 
 
 def get_page_info(html: str):
