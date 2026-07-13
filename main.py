@@ -58,13 +58,7 @@ def main():
 
         print(f"所有分页共发现 {len(all_links)} 个下载链接。")
         print(f"下载队列已创建，共 {len(queue)} 个项目。")
-
-        for item in queue.items[:5]:
-            print(
-                f"- status={item.download_status}, invoice_id={item.invoice_id}, "
-                f"billing_period={item.billing_period}, filename={item.filename}, "
-                f"url={item.download_url}"
-            )
+        print("下载队列项目已准备完成，当前仅排队，不执行下载。")
 
         input("按 Enter 结束程序...")
 
