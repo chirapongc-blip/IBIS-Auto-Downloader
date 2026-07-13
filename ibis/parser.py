@@ -59,7 +59,7 @@ def get_page_info(html: str):
 
 
 def _extract_invoice_metadata(anchor):
-    row = anchor.find_parent("tr")
+    row = _find_data_row(anchor)
     if row is None:
         return {"invoice_id": None, "billing_period": None, "filename": None}
 
@@ -76,6 +76,20 @@ def _extract_invoice_metadata(anchor):
         "billing_period": billing_period or None,
         "filename": filename or None,
     }
+
+
+def _find_data_row(anchor):
+    for parent in anchor.parents:
+        if parent.name != "tr":
+            continue
+
+        row_id = parent.get("id", "")
+        row_classes = parent.get("class", [])
+
+        if "DXDataRow" in row_id or any("dxgvDataRow" in cls for cls in row_classes):
+            return parent
+
+    return None
 
 
 def _get_cell_text(cells, index: int):
