@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+from selenium.common.exceptions import WebDriverException
+
 from ibis.grid import GRID_ID
 from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_info
 
@@ -33,6 +35,14 @@ class FakeDriver:
 
     def execute_script(self, script, *args):
         if "GVPagerOnClick" in script and args[1] == "PBN":
+            self.page_index += 1
+
+
+class JsFailureDriver(FakeDriver):
+    def execute_script(self, script, *args):
+        if "GVPagerOnClick" in script:
+            raise WebDriverException("js pager invocation failed")
+        if "arguments[0].click();" in script:
             self.page_index += 1
 
 
@@ -144,6 +154,21 @@ class GridWalkerTests(unittest.TestCase):
             )
 
         self.assertEqual(len(links), 1)
+
+    def test_falls_back_to_click_when_js_pager_invocation_fails(self):
+        pages = [
+            build_page(1, 2, [1001]),
+            build_page(2, 2, [2001]),
+        ]
+        driver = JsFailureDriver(pages)
+
+        with patch("ibis.grid_walker.wait_for_grid", return_value=None), \
+             patch("ibis.grid_walker.WebDriverWait", ImmediateWait):
+            links = collect_grid_download_links(
+                driver, "https://stationsatcom.satcomhost.com"
+            )
+
+        self.assertEqual(len(links), 2)
 
 
 if __name__ == "__main__":

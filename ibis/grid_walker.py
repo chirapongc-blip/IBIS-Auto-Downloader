@@ -1,6 +1,7 @@
 import re
 
 from bs4 import BeautifulSoup
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -71,7 +72,9 @@ def collect_grid_download_links(
         current_page = pager_info.get("current_page", 1)
 
         if current_page in visited_pages:
-            break
+            raise RuntimeError(
+                f"Page navigation failed: pager repeated page {current_page}."
+            )
 
         visited_pages.add(current_page)
         _extend_unique_links(links, seen_urls, extract_invoice_links(html, base_url))
@@ -120,21 +123,21 @@ def _go_to_next_page(driver, current_page: int, grid_id: str, timeout: int):
     onclick = next_button.get_attribute("onclick") or ""
     match = PAGER_ACTION_RE.search(onclick)
 
-    if match:
-        driver.execute_script(
-            "ASPx.GVPagerOnClick(arguments[0], arguments[1]);",
-            match.group(1),
-            match.group(2),
-        )
-    else:
-        driver.execute_script("arguments[0].click();", next_button)
+    if match and _invoke_js_pager(driver, match.group(1), match.group(2), timeout, grid_id, current_page):
+        wait_for_grid(driver, timeout)
+        return
 
-    WebDriverWait(driver, timeout).until(
-        lambda d: get_devexpress_pager_info(d.page_source, grid_id).get(
-            "current_page", 1
+    try:
+        driver.execute_script("arguments[0].click();", next_button)
+    except WebDriverException as exc:
+        raise RuntimeError(
+            f"Failed to navigate from page {current_page} using pager controls."
+        ) from exc
+
+    if not _wait_for_page_advance(driver, timeout, grid_id, current_page):
+        raise RuntimeError(
+            f"Page navigation failed: could not advance from page {current_page}."
         )
-        > current_page
-    )
     wait_for_grid(driver, timeout)
 
 
@@ -152,3 +155,30 @@ def _find_next_button(driver, grid_id: str):
             return candidate
 
     return None
+
+
+def _invoke_js_pager(driver, grid_id: str, action: str, timeout: int, wait_grid_id: str, current_page: int) -> bool:
+    try:
+        driver.execute_script(
+            "ASPx.GVPagerOnClick(arguments[0], arguments[1]);",
+            grid_id,
+            action,
+        )
+    except WebDriverException:
+        return False
+
+    return _wait_for_page_advance(driver, timeout, wait_grid_id, current_page)
+
+
+def _wait_for_page_advance(driver, timeout: int, grid_id: str, current_page: int) -> bool:
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: get_devexpress_pager_info(d.page_source, grid_id).get(
+                "current_page", 1
+            )
+            > current_page
+        )
+    except TimeoutException:
+        return False
+
+    return True
