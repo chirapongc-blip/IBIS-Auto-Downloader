@@ -19,6 +19,6 @@ print()
 print("========== LINKS ==========")
 
 for i, link in enumerate(links, 1):
-    print(i, link["url"])
+    print(i, link.get("invoice_id"), link.get("filename"))
 
 driver.quit()
