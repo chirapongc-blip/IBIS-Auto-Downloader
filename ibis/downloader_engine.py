@@ -1,4 +1,5 @@
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from ibis.downloader import get_download_dir, STATUS_PENDING
@@ -7,9 +8,19 @@ from ibis.downloader import get_download_dir, STATUS_PENDING
 STATUS_DOWNLOADING = "downloading"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
+STATUS_SKIPPED = "skipped"
 _INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp")
 
 MAX_RETRIES = 3
+
+
+@dataclass
+class DownloadSummary:
+    total_files: int = 0
+    completed: int = 0
+    failed: int = 0
+    retried: int = 0
+    skipped: int = 0
 
 
 class DownloadError(Exception):
@@ -51,10 +62,14 @@ class DownloaderEngine:
         self.download_dir = Path(download_dir) if download_dir is not None else get_download_dir()
         self.timeout = timeout
         self.poll_interval = poll_interval
+        self.summary = DownloadSummary()
 
     def run(self, plan):
+        self.summary = DownloadSummary(total_files=len(plan.scheduled_items))
+        started_at = time.monotonic()
         for item in plan.scheduled_items:
             self._download_item(item)
+        self._print_summary(time.monotonic() - started_at)
 
     def _download_item(self, item):
         self._set_status(item, STATUS_PENDING)
@@ -76,7 +91,7 @@ class DownloaderEngine:
                     )
 
                 item.filename = downloaded_file.name
-                self._set_status(item, STATUS_COMPLETED)
+                self._finalize_item(item, STATUS_COMPLETED)
                 return
 
             except Exception as exc:
@@ -85,7 +100,7 @@ class DownloaderEngine:
                     break
                 item.retry_count += 1
 
-        self._set_status(item, STATUS_FAILED)
+        self._finalize_item(item, STATUS_FAILED)
 
     def _wait_for_download(self, existing_files):
         deadline = time.monotonic() + self.timeout
@@ -115,3 +130,31 @@ class DownloaderEngine:
 
     def _set_status(self, item, status):
         item.download_status = status
+
+    def _finalize_item(self, item, status):
+        self._set_status(item, status)
+        if status == STATUS_COMPLETED:
+            self.summary.completed += 1
+        elif status == STATUS_FAILED:
+            self.summary.failed += 1
+        elif status == STATUS_SKIPPED:
+            self.summary.skipped += 1
+
+        if item.retry_count > 0:
+            self.summary.retried += 1
+
+        terminal_count = self.summary.completed + self.summary.failed + self.summary.skipped
+        print(f"[{terminal_count}/{self.summary.total_files}] {status.title()} {self._item_label(item)}")
+
+    def _item_label(self, item):
+        return item.filename or f"{item.invoice_id or item.download_url}"
+
+    def _print_summary(self, elapsed_seconds):
+        print("Download Summary")
+        print("----------------")
+        print(f"Total: {self.summary.total_files}")
+        print(f"Completed: {self.summary.completed}")
+        print(f"Failed: {self.summary.failed}")
+        print(f"Retried: {self.summary.retried}")
+        print(f"Skipped: {self.summary.skipped}")
+        print(f"Elapsed: {elapsed_seconds:.1f} s")

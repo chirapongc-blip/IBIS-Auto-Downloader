@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from ibis.downloader import DownloadQueue, STATUS_PENDING
 from ibis.downloader_engine import (
+    DownloadSummary,
     DownloaderEngine,
     DuplicateFileError,
     Http404Error,
@@ -14,6 +15,7 @@ from ibis.downloader_engine import (
     STATUS_COMPLETED,
     STATUS_DOWNLOADING,
     STATUS_FAILED,
+    STATUS_SKIPPED,
     TemporaryBrowserError,
     DownloadTimeoutError,
 )
@@ -364,6 +366,136 @@ class DownloaderEngineTests(unittest.TestCase):
 
             statuses = [call.args[1] for call in mocked.call_args_list if call.args[0] is item]
             self.assertEqual(statuses, [STATUS_PENDING, STATUS_DOWNLOADING, STATUS_FAILED])
+
+    def test_summary_counts_terminal_states_and_retried_files(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            links = [
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=5001&BillingPeriod=202605&Format=Detailed",
+                    "filename": "invoice-5001.pdf",
+                },
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=5002&BillingPeriod=202605&Format=Detailed",
+                    "filename": "invoice-5002.pdf",
+                },
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=5003&BillingPeriod=202605&Format=Detailed",
+                    "filename": "invoice-5003.pdf",
+                },
+            ]
+            queue = DownloadQueue.from_links(links)
+            plan = DownloadPlan(queue)
+
+            driver = FlakeyDriver(
+                download_dir,
+                file_by_url={
+                    links[0]["url"]: "invoice-5001.pdf",
+                    links[1]["url"]: "invoice-5002.pdf",
+                },
+                exc_by_url={
+                    links[1]["url"]: [
+                        TemporaryBrowserError("connection reset"),
+                        DownloadTimeoutError("timeout"),
+                    ],
+                    links[2]["url"]: [TemporaryBrowserError("flaky")] * (MAX_RETRIES + 1),
+                },
+            )
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+            )
+
+            engine.run(plan)
+
+            self.assertEqual(
+                engine.summary,
+                DownloadSummary(
+                    total_files=3,
+                    completed=2,
+                    failed=1,
+                    retried=2,
+                    skipped=0,
+                ),
+            )
+
+    def test_skipped_items_increment_terminal_progress_once(self):
+        queue = DownloadQueue.from_links(
+            [
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=5004&BillingPeriod=202605&Format=Detailed",
+                    "filename": "invoice-5004.pdf",
+                }
+            ]
+        )
+        item = queue.items[0]
+        engine = DownloaderEngine(driver=None, download_dir=Path("."))
+        engine.summary = DownloadSummary(total_files=1)
+
+        with patch("builtins.print") as mocked_print:
+            engine._finalize_item(item, STATUS_SKIPPED)
+
+        self.assertEqual(item.download_status, STATUS_SKIPPED)
+        self.assertEqual(engine.summary.skipped, 1)
+        self.assertEqual(engine.summary.completed, 0)
+        self.assertEqual(engine.summary.failed, 0)
+        mocked_print.assert_called_once_with("[1/1] Skipped invoice-5004.pdf")
+
+    def test_progress_output_and_final_summary_are_terminal_state_oriented(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            links = [
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=5005&BillingPeriod=202605&Format=Detailed",
+                    "filename": "invoice-5005.pdf",
+                },
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=5006&BillingPeriod=202605&Format=Detailed",
+                    "filename": "invoice-5006.pdf",
+                },
+            ]
+            queue = DownloadQueue.from_links(links)
+            plan = DownloadPlan(queue)
+            driver = FlakeyDriver(
+                download_dir,
+                file_by_url={links[0]["url"]: "invoice-5005.pdf"},
+                exc_by_url={links[1]["url"]: [Http404Error("404 Not Found")]},
+            )
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+            )
+
+            with patch("builtins.print") as mocked_print:
+                engine.run(plan)
+
+            printed_lines = [call.args[0] for call in mocked_print.call_args_list]
+            progress_lines = [line for line in printed_lines if line.startswith("[")]
+            self.assertEqual(
+                progress_lines,
+                [
+                    "[1/2] Completed invoice-5005.pdf",
+                    "[2/2] Failed invoice-5006.pdf",
+                ],
+            )
+            self.assertEqual(len(progress_lines), 2)
+            self.assertEqual(
+                printed_lines[-8:-1],
+                [
+                    "Download Summary",
+                    "----------------",
+                    "Total: 2",
+                    "Completed: 1",
+                    "Failed: 1",
+                    "Retried: 0",
+                    "Skipped: 0",
+                ],
+            )
+            self.assertRegex(printed_lines[-1], r"^Elapsed: \d+\.\d s$")
 
 
 if __name__ == "__main__":
