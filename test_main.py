@@ -51,7 +51,6 @@ class TestMainFlowIntegration(unittest.TestCase):
 
             mock_plan_instance = MockPlan.return_value
             mock_plan_instance.scheduled_count = 1
-            mock_plan_instance.latest_billing_period = "202605"
 
             mock_engine_instance = MockEngine.return_value
 

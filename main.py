@@ -62,7 +62,7 @@ def main():
         print(f"下载队列已创建，共 {len(queue)} 个项目。")
 
         plan = DownloadPlan(queue)
-        print(f"下载计划已建立，共 {plan.scheduled_count} 个项目（最新账期：{plan.latest_billing_period}）。")
+        print(f"下载计划已建立，共 {plan.scheduled_count} 个项目。")
 
         engine = DownloaderEngine(driver)
         engine.run(plan)
