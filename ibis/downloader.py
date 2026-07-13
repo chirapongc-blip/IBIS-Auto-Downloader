@@ -14,6 +14,8 @@ class DownloadQueueItem:
     billing_period: str | None
     filename: str | None
     download_status: str = STATUS_PENDING
+    retry_count: int = 0
+    last_error: str | None = None
 
 
 class DownloadQueue:

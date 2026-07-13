@@ -9,6 +9,41 @@ STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 _INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp")
 
+MAX_RETRIES = 3
+
+
+class DownloadError(Exception):
+    """Base class for all download-related errors."""
+
+
+class DownloadTimeoutError(DownloadError):
+    """Raised when a download times out waiting for a file to appear (retryable)."""
+
+
+class IncompleteDownloadError(DownloadError):
+    """Raised when a download completes but the expected file is missing (retryable)."""
+
+
+class TemporaryBrowserError(DownloadError):
+    """Raised for transient browser or network failures (retryable)."""
+
+
+class Http404Error(DownloadError):
+    """Raised when the server returns HTTP 404 (not retryable)."""
+
+
+class InvalidUrlError(DownloadError):
+    """Raised when the download URL is invalid (not retryable)."""
+
+
+class DuplicateFileError(DownloadError):
+    """Raised when the file has already been downloaded (not retryable)."""
+
+
+def is_retryable(exc):
+    """Return True if *exc* represents a transient failure that warrants a retry."""
+    return isinstance(exc, (DownloadTimeoutError, IncompleteDownloadError, TemporaryBrowserError))
+
 
 class DownloaderEngine:
     def __init__(self, driver, *, download_dir=None, timeout=60, poll_interval=0.2):
@@ -24,20 +59,33 @@ class DownloaderEngine:
     def _download_item(self, item):
         self._set_status(item, STATUS_PENDING)
         self._set_status(item, STATUS_DOWNLOADING)
-        existing_files = self._snapshot_files()
 
-        try:
-            self.driver.get(item.download_url)
-            downloaded_file = self._wait_for_download(existing_files)
-            if downloaded_file is None or not downloaded_file.exists():
-                raise FileNotFoundError(
-                    f"Download did not produce a file for URL: {item.download_url}"
-                )
+        for attempt in range(MAX_RETRIES + 1):
+            existing_files = self._snapshot_files()
+            try:
+                self.driver.get(item.download_url)
+                downloaded_file = self._wait_for_download(existing_files)
 
-            item.filename = downloaded_file.name
-            self._set_status(item, STATUS_COMPLETED)
-        except Exception:
-            self._set_status(item, STATUS_FAILED)
+                if downloaded_file is None:
+                    raise DownloadTimeoutError(
+                        f"Download timed out for URL: {item.download_url}"
+                    )
+                if not downloaded_file.exists():
+                    raise IncompleteDownloadError(
+                        f"Download file missing for URL: {item.download_url}"
+                    )
+
+                item.filename = downloaded_file.name
+                self._set_status(item, STATUS_COMPLETED)
+                return
+
+            except Exception as exc:
+                item.last_error = str(exc)
+                if not is_retryable(exc) or attempt == MAX_RETRIES:
+                    break
+                item.retry_count += 1
+
+        self._set_status(item, STATUS_FAILED)
 
     def _wait_for_download(self, existing_files):
         deadline = time.monotonic() + self.timeout
