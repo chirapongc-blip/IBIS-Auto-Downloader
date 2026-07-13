@@ -17,8 +17,6 @@ links = extract_invoice_links(html, BASE_URL)
 print()
 
 print("========== LINKS ==========")
-
-for i, link in enumerate(links, 1):
-    print(i, link.get("invoice_id"), link.get("filename"))
+print(f"Collected {len(links)} invoice download links")
 
 driver.quit()
