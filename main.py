@@ -2,7 +2,8 @@ from config import BASE_URL
 from selenium.webdriver.common.by import By
 
 from ibis.browser import create_driver
-from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_info
+from ibis.downloader import DownloadQueue
+from ibis.grid_walker import get_devexpress_pager_info
 from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
@@ -52,9 +53,11 @@ def main():
         print(get_grid_text(driver)[:1000])
         print("==================================\n")
 
-        all_links = collect_grid_download_links(driver, BASE_URL)
+        queue = DownloadQueue.from_grid(driver, BASE_URL)
 
-        print(f"所有分页共发现 {len(all_links)} 个下载链接。")
+        print(f"所有分页共发现 {len(queue)} 个下载队列项目。")
+        for item in queue.items[:5]:
+            print(item)
 
         input("按 Enter 结束程序...")
 
