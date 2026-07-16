@@ -9,8 +9,13 @@ from ibis.grid import GRID_ID, get_page_info, wait_for_grid
 from ibis.parser import extract_invoice_links
 
 
-PAGER_SELECTOR = ".dxgvPagerBottomPanel, .dxgvPagerTopPanel"
-PAGER_ACTION_RE = re.compile(r"GVPagerOnClick\('([^']+)','([^']+)'\)")
+PAGER_SELECTOR = (
+    "[class*='dxgvPagerBottomPanel'], "
+    "[class*='dxgvPagerTopPanel']"
+)
+PAGER_ACTION_RE = re.compile(
+    r"GVPagerOnClick\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)"
+)
 PAGER_SUMMARY_RE = re.compile(r"Page\s+(\d+)\s+of\s+(\d+)", re.IGNORECASE)
 
 
@@ -33,18 +38,22 @@ def get_devexpress_pager_info(html: str, grid_id: str = GRID_ID):
     if pager is None:
         return info
 
-    if "current_page" not in info or "total_pages" not in info:
-        summary = pager.select_one(".dxp-summary")
-        if summary:
-            match = PAGER_SUMMARY_RE.search(summary.get_text(" ", strip=True))
-            if match:
-                info.setdefault("current_page", int(match.group(1)))
-                info.setdefault("total_pages", int(match.group(2)))
+    summary = pager.select_one(".dxp-summary")
+    if summary:
+        match = PAGER_SUMMARY_RE.search(summary.get_text(" ", strip=True))
+        if match:
+            current_from_summary = int(match.group(1))
+            total_from_summary = int(match.group(2))
+            if total_from_summary > 0:
+                info["current_page"] = current_from_summary
+                info["total_pages"] = total_from_summary
 
-    info["has_next_page"] = (
-        pager.select_one(f"a[onclick*=\"GVPagerOnClick('{grid_id}','PBN')\"]")
-        is not None
-    )
+    current_page = info.get("current_page", 1)
+    total_pages = info.get("total_pages", 0)
+    if total_pages > 0:
+        info["has_next_page"] = current_page < total_pages
+    else:
+        info["has_next_page"] = _pager_has_next_action(pager, grid_id, current_page)
 
     return info
 
@@ -103,6 +112,14 @@ def _find_pager(soup: BeautifulSoup, grid_id: str):
     return None
 
 
+def _pager_has_next_action(pager, grid_id: str, current_page: int) -> bool:
+    return _find_next_action_from_anchors(
+        pager.select("a[onclick*='GVPagerOnClick']"),
+        grid_id,
+        current_page,
+    ) is not None
+
+
 def _extend_unique_links(links, seen_urls, page_links):
     for link in page_links:
         url = link["url"]
@@ -113,17 +130,15 @@ def _extend_unique_links(links, seen_urls, page_links):
 
 
 def _go_to_next_page(driver, current_page: int, grid_id: str, timeout: int):
-    next_button = _find_next_button(driver, grid_id)
-    if next_button is None:
+    next_target = _find_next_button(driver, grid_id, current_page)
+    if next_target is None:
         raise RuntimeError(
-            "DevExpress pager was detected but the next-page control (PBN) "
-            "was not found in the DOM."
+            "DevExpress pager was detected but no usable next-page control "
+            "was found in the DOM."
         )
 
-    onclick = next_button.get_attribute("onclick") or ""
-    match = PAGER_ACTION_RE.search(onclick)
-
-    if match and _invoke_js_pager(driver, match.group(1), match.group(2), timeout, grid_id, current_page):
+    next_button, next_action = next_target
+    if _invoke_js_pager(driver, grid_id, next_action, timeout, grid_id, current_page):
         wait_for_grid(driver, timeout)
         return
 
@@ -141,20 +156,48 @@ def _go_to_next_page(driver, current_page: int, grid_id: str, timeout: int):
     wait_for_grid(driver, timeout)
 
 
-def _find_next_button(driver, grid_id: str):
+def _find_next_button(driver, grid_id: str, current_page: int):
     candidates = driver.find_elements(
         By.CSS_SELECTOR,
-        ".dxgvPagerBottomPanel a[onclick*='GVPagerOnClick'],"
-        " .dxgvPagerTopPanel a[onclick*='GVPagerOnClick']",
+        "[class*='dxgvPagerBottomPanel'] a[onclick*='GVPagerOnClick'],"
+        " [class*='dxgvPagerTopPanel'] a[onclick*='GVPagerOnClick']",
     )
+    return _find_next_action_from_anchors(candidates, grid_id, current_page)
 
-    for candidate in candidates:
-        onclick = candidate.get_attribute("onclick") or ""
+
+def _find_next_action_from_anchors(anchors, grid_id: str, current_page: int):
+    fallback = None
+    fallback_target_page = None
+
+    for anchor in anchors:
+        if hasattr(anchor, "get_attribute"):
+            onclick = anchor.get_attribute("onclick") or ""
+        else:
+            onclick = anchor.get("onclick") or ""
         match = PAGER_ACTION_RE.search(onclick)
-        if match and match.group(1) == grid_id and match.group(2) == "PBN":
-            return candidate
+        if not match or match.group(1) != grid_id:
+            continue
 
-    return None
+        action = match.group(2)
+        if action == "PBN":
+            return anchor, action
+
+        if not action.startswith("PN"):
+            continue
+
+        page_index_text = action[2:]
+        if not page_index_text.isdigit():
+            continue
+
+        target_page = int(page_index_text) + 1
+        if target_page <= current_page:
+            continue
+
+        if fallback_target_page is None or target_page < fallback_target_page:
+            fallback_target_page = target_page
+            fallback = (anchor, action)
+
+    return fallback
 
 
 def _invoke_js_pager(driver, grid_id: str, action: str, timeout: int, wait_grid_id: str, current_page: int) -> bool:

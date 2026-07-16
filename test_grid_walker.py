@@ -34,7 +34,7 @@ class FakeDriver:
         return [FakeElement(f"ASPx.GVPagerOnClick('{GRID_ID}','PBN');")]
 
     def execute_script(self, script, *args):
-        if "GVPagerOnClick" in script and args[1] == "PBN":
+        if "GVPagerOnClick" in script:
             self.page_index += 1
 
 
@@ -57,13 +57,32 @@ class ImmediateWait:
         return result
 
 
-def build_page(page_number, total_pages, invoice_ids):
+def build_page(
+    page_number,
+    total_pages,
+    invoice_ids,
+    *,
+    pager_panel_class="dxgvPagerBottomPanel",
+    navigation_mode="pbn",
+    script_page_count=None,
+):
+    if script_page_count is None:
+        script_page_count = total_pages
+
     next_button = ""
     if page_number < total_pages:
-        next_button = (
-            f"<a id=\"{GRID_ID}_DXPagerBottom_PBN\" class=\"dxp-button dxp-bi\" "
-            f"onclick=\"ASPx.GVPagerOnClick('{GRID_ID}','PBN');\">Next</a>"
-        )
+        if navigation_mode == "pbn":
+            next_button = (
+                f"<a id=\"{GRID_ID}_DXPagerBottom_PBN\" class=\"dxp-button dxp-bi\" "
+                f"onclick=\"ASPx.GVPagerOnClick('{GRID_ID}','PBN');\">Next</a>"
+            )
+        elif navigation_mode == "numbered":
+            next_page_index = page_number
+            next_button = (
+                f"<a class=\"dxp-num\" "
+                f"onclick=\"ASPx.GVPagerOnClick('{GRID_ID}','PN{next_page_index}');\">"
+                f"{page_number + 1}</a>"
+            )
 
     links = "".join(
         f"<a title=\"Invoice Charges\" "
@@ -77,7 +96,7 @@ def build_page(page_number, total_pages, invoice_ids):
         <table id="{GRID_ID}">
           <tr><td>{links}</td></tr>
         </table>
-        <div class="dxgvPagerBottomPanel">
+        <div class="{pager_panel_class}">
           <div class="dxpLite_MetropolisBlue" id="{GRID_ID}_DXPagerBottom">
             <b class="dxp-lead dxp-summary">Page {page_number} of {total_pages} ({total_pages * 20} items)</b>
             {next_button}
@@ -85,7 +104,7 @@ def build_page(page_number, total_pages, invoice_ids):
         </div>
         <script>
           ASPx.createControl(ASPxClientGridView,'{GRID_ID}','gvInvoice',
-            {{'pageRowCount':20,'pageIndex':{page_number - 1},'pageCount':{total_pages}}});
+            {{'pageRowCount':20,'pageIndex':{page_number - 1},'pageCount':{script_page_count}}});
         </script>
       </body>
     </html>
@@ -139,6 +158,68 @@ class GridWalkerTests(unittest.TestCase):
                 "https://stationsatcom.satcomhost.com/DownloadARExport.aspx?InvoiceID=2002&Format=Detailed",
                 "https://stationsatcom.satcomhost.com/DownloadARExport.aspx?InvoiceID=3001&Format=Detailed",
                 "https://stationsatcom.satcomhost.com/DownloadARExport.aspx?InvoiceID=3002&Format=Detailed",
+            ],
+        )
+
+    def test_collects_all_pages_for_themed_devexpress_pager(self):
+        pages = [
+            build_page(
+                1,
+                3,
+                [1001],
+                pager_panel_class="dxgvPagerBottomPanel_MetropolisBlue",
+                script_page_count=0,
+            ),
+            build_page(
+                2,
+                3,
+                [2001],
+                pager_panel_class="dxgvPagerBottomPanel_MetropolisBlue",
+                script_page_count=0,
+            ),
+            build_page(
+                3,
+                3,
+                [3001],
+                pager_panel_class="dxgvPagerBottomPanel_MetropolisBlue",
+                script_page_count=0,
+            ),
+        ]
+        driver = FakeDriver(pages)
+
+        with patch("ibis.grid_walker.wait_for_grid", return_value=None), \
+             patch("ibis.grid_walker.WebDriverWait", ImmediateWait):
+            links = collect_grid_download_links(
+                driver, "https://stationsatcom.satcomhost.com"
+            )
+
+        self.assertEqual(
+            [link["url"] for link in links],
+            [
+                "https://stationsatcom.satcomhost.com/DownloadARExport.aspx?InvoiceID=1001&Format=Detailed",
+                "https://stationsatcom.satcomhost.com/DownloadARExport.aspx?InvoiceID=2001&Format=Detailed",
+                "https://stationsatcom.satcomhost.com/DownloadARExport.aspx?InvoiceID=3001&Format=Detailed",
+            ],
+        )
+
+    def test_collects_links_with_numbered_pager_navigation(self):
+        pages = [
+            build_page(1, 2, [1001], navigation_mode="numbered"),
+            build_page(2, 2, [2001], navigation_mode="numbered"),
+        ]
+        driver = FakeDriver(pages)
+
+        with patch("ibis.grid_walker.wait_for_grid", return_value=None), \
+             patch("ibis.grid_walker.WebDriverWait", ImmediateWait):
+            links = collect_grid_download_links(
+                driver, "https://stationsatcom.satcomhost.com"
+            )
+
+        self.assertEqual(
+            [link["url"] for link in links],
+            [
+                "https://stationsatcom.satcomhost.com/DownloadARExport.aspx?InvoiceID=1001&Format=Detailed",
+                "https://stationsatcom.satcomhost.com/DownloadARExport.aspx?InvoiceID=2001&Format=Detailed",
             ],
         )
 
