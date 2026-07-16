@@ -597,6 +597,27 @@ class DownloaderEngineTests(unittest.TestCase):
             # Original collision file is untouched.
             self.assertTrue((download_dir / "202605_7001.xlsx").exists())
 
+    def test_crdownload_completion_waits_for_matching_crdownload_to_disappear(self):
+        """_find_new_completed_file must skip a completed file while its matching
+        .crdownload companion (e.g. invoice.xlsx.crdownload) still exists, and
+        return the file only once the companion is gone."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            existing_files = engine._snapshot_files()
+
+            final_file = download_dir / "invoice.xlsx"
+            crdownload = download_dir / "invoice.xlsx.crdownload"
+            final_file.write_text("data", encoding="utf-8")
+            crdownload.write_text("partial", encoding="utf-8")
+
+            # Companion still present — should not return the final file yet.
+            self.assertIsNone(engine._find_new_completed_file(existing_files))
+
+            # Companion removed — download is complete.
+            crdownload.unlink()
+            self.assertEqual(engine._find_new_completed_file(existing_files), final_file)
+
     def test_crdownload_file_is_not_renamed(self):
         """A file with a .crdownload suffix must never be renamed."""
         with TemporaryDirectory() as tmp:

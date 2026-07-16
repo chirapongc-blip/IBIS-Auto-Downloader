@@ -116,12 +116,17 @@ class DownloaderEngine:
         return None
 
     def _find_new_completed_file(self, existing_files):
+        current_files = self._snapshot_files()
         for file_path in sorted(
-            self._snapshot_files() - existing_files,
+            current_files - existing_files,
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         ):
             if file_path.suffix.lower() in _INCOMPLETE_SUFFIXES:
+                continue
+            # Skip if the matching .crdownload companion still exists — the
+            # browser hasn't finished writing the file yet.
+            if (file_path.parent / (file_path.name + ".crdownload")) in current_files:
                 continue
             return file_path
         return None
