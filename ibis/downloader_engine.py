@@ -90,7 +90,8 @@ class DownloaderEngine:
                         f"Download file missing for URL: {item.download_url}"
                     )
 
-                item.filename = downloaded_file.name
+                renamed = self._rename_downloaded_file(downloaded_file, item)
+                item.filename = renamed.name
                 self._finalize_item(item, STATUS_COMPLETED)
                 return
 
@@ -123,6 +124,30 @@ class DownloaderEngine:
                 continue
             return file_path
         return None
+
+    def _build_target_filename(self, item) -> str | None:
+        """Return the desired final filename for *item*, or None to keep the downloaded name."""
+        pre_set = item.filename
+        if pre_set:
+            p = Path(pre_set)
+            if not p.suffix:
+                return f"{p.stem}.xlsx"
+            return pre_set
+        if item.billing_period and item.invoice_id:
+            return f"{item.billing_period}_{item.invoice_id}.xlsx"
+        return None
+
+    def _rename_downloaded_file(self, downloaded_file: Path, item) -> Path:
+        """Rename *downloaded_file* to a meaningful name; return the final path."""
+        target_name = self._build_target_filename(item)
+        if target_name is None or target_name == downloaded_file.name:
+            return downloaded_file
+        target_path = downloaded_file.parent / target_name
+        try:
+            downloaded_file.rename(target_path)
+            return target_path
+        except OSError:
+            return downloaded_file
 
     def _snapshot_files(self):
         self.download_dir.mkdir(parents=True, exist_ok=True)
