@@ -1,4 +1,5 @@
 import unittest
+import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -572,6 +573,76 @@ class DownloaderEngineTests(unittest.TestCase):
             self.assertEqual(item.download_status, STATUS_COMPLETED)
             self.assertEqual(item.filename, "download.xlsx")
             self.assertTrue((download_dir / "download.xlsx").exists())
+
+
+    def test_rename_appends_suffix_when_target_already_exists(self):
+        """When the target filename already exists, a unique _{n} suffix is appended."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=7001&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+
+            # Pre-create the expected target so there is a collision.
+            (download_dir / "202605_7001.xlsx").write_text("existing", encoding="utf-8")
+
+            driver = FakeDriver(download_dir, file_by_url={url: "DownloadARExport.aspx"})
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertEqual(item.filename, "202605_7001_1.xlsx")
+            self.assertTrue((download_dir / "202605_7001_1.xlsx").exists())
+            # Original collision file is untouched.
+            self.assertTrue((download_dir / "202605_7001.xlsx").exists())
+
+    def test_crdownload_file_is_not_renamed(self):
+        """A file with a .crdownload suffix must never be renamed."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            crdownload = download_dir / "partial.crdownload"
+            crdownload.write_text("partial", encoding="utf-8")
+
+            from ibis.downloader import DownloadQueueItem
+            item = DownloadQueueItem(
+                download_url="https://example.com/x",
+                invoice_id="8001",
+                billing_period="202605",
+                filename=None,
+            )
+            result = engine._rename_downloaded_file(crdownload, item)
+
+            self.assertIs(result, crdownload)
+            self.assertTrue(crdownload.exists())
+            self.assertFalse((download_dir / "202605_8001.xlsx").exists())
+
+    def test_rename_failure_issues_warning_and_keeps_original_filename(self):
+        """When the OS rename fails a warning is emitted and the original path is returned."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            original = download_dir / "DownloadARExport.aspx"
+            original.write_text("data", encoding="utf-8")
+
+            from ibis.downloader import DownloadQueueItem
+            item = DownloadQueueItem(
+                download_url="https://example.com/x",
+                invoice_id="9001",
+                billing_period="202605",
+                filename=None,
+            )
+
+            with patch.object(Path, "rename", side_effect=OSError("permission denied")), \
+                 warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = engine._rename_downloaded_file(original, item)
+
+            self.assertIs(result, original)
+            self.assertEqual(len(caught), 1)
+            self.assertIn("permission denied", str(caught[0].message))
+            self.assertIn("202605_9001.xlsx", str(caught[0].message))
 
 
 if __name__ == "__main__":

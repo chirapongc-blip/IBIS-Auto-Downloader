@@ -1,4 +1,5 @@
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -138,16 +139,46 @@ class DownloaderEngine:
         return None
 
     def _rename_downloaded_file(self, downloaded_file: Path, item) -> Path:
-        """Rename *downloaded_file* to a meaningful name; return the final path."""
+        """Rename *downloaded_file* to a meaningful name; return the final path.
+
+        Guards:
+        - Never renames an incomplete file (e.g. .crdownload).
+        - If the target already exists, appends a numeric suffix to avoid collision.
+        - Logs a warning instead of silently swallowing rename failures.
+        """
+        if downloaded_file.suffix.lower() in _INCOMPLETE_SUFFIXES:
+            return downloaded_file
+
         target_name = self._build_target_filename(item)
         if target_name is None or target_name == downloaded_file.name:
             return downloaded_file
-        target_path = downloaded_file.parent / target_name
+
+        target_path = self._unique_path(downloaded_file.parent / target_name)
         try:
             downloaded_file.rename(target_path)
             return target_path
-        except OSError:
+        except OSError as exc:
+            warnings.warn(
+                f"Failed to rename '{downloaded_file.name}' to '{target_path.name}': {exc}. "
+                "Keeping original filename.",
+                stacklevel=2,
+            )
             return downloaded_file
+
+    @staticmethod
+    def _unique_path(path: Path) -> Path:
+        """Return *path* unchanged if it does not exist, otherwise append _{n} before the suffix."""
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        parent = path.parent
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}_{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
 
     def _snapshot_files(self):
         self.download_dir.mkdir(parents=True, exist_ok=True)
@@ -172,7 +203,7 @@ class DownloaderEngine:
         print(f"[{terminal_count}/{self.summary.total_files}] {status.title()} {self._item_label(item)}")
 
     def _item_label(self, item):
-        return item.filename or f"{item.invoice_id or item.download_url}"
+        return item.filename or item.invoice_id or "<unknown>"
 
     def _print_summary(self, elapsed_seconds):
         print("Download Summary")
