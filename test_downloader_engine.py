@@ -66,6 +66,26 @@ class FlakeyDriver:
             (self.download_dir / filename).write_text("pdf", encoding="utf-8")
 
 
+class IncompleteThenCompleteDriver:
+    def __init__(self, download_dir: Path, url: str, temp_name: str, final_name: str):
+        self.download_dir = download_dir
+        self.url = url
+        self.temp_name = temp_name
+        self.final_name = final_name
+        self.opened_urls = []
+
+    def get(self, url):
+        self.opened_urls.append(url)
+        if url != self.url:
+            return
+        temp_path = self.download_dir / self.temp_name
+        temp_path.write_text("partial", encoding="utf-8")
+
+        final_path = self.download_dir / self.final_name
+        final_path.write_text("xlsx", encoding="utf-8")
+        temp_path.unlink()
+
+
 class DownloaderEngineTests(unittest.TestCase):
     def test_downloads_all_plan_items_sequentially_and_marks_completed(self):
         with TemporaryDirectory() as tmp:
@@ -279,7 +299,7 @@ class DownloaderEngineTests(unittest.TestCase):
             self.assertEqual(item.download_status, STATUS_FAILED)
             self.assertEqual(item.retry_count, 0)
             self.assertIn("invalid URL", item.last_error)
-            self.assertEqual(driver.opened_urls, [url])
+            self.assertEqual(driver.opened_urls, [])
 
     def test_no_retry_for_duplicate_file(self):
         """DuplicateFileError is non-retryable; engine gives up immediately."""
@@ -366,6 +386,90 @@ class DownloaderEngineTests(unittest.TestCase):
 
             statuses = [call.args[1] for call in mocked.call_args_list if call.args[0] is item]
             self.assertEqual(statuses, [STATUS_PENDING, STATUS_DOWNLOADING, STATUS_FAILED])
+
+    def test_waits_until_crdownload_disappears_before_completing(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=7777&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+
+            driver = IncompleteThenCompleteDriver(
+                download_dir,
+                url=url,
+                temp_name="invoice-7777.xlsx.crdownload",
+                final_name="invoice-7777.xlsx",
+            )
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+            )
+
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertFalse((download_dir / "invoice-7777.xlsx.crdownload").exists())
+            self.assertTrue((download_dir / "invoice-7777.xlsx").exists())
+
+    def test_renames_download_to_invoice_filename_with_extension(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            link = {
+                "url": "https://example.com/DownloadARExport.aspx?InvoiceID=8888&BillingPeriod=202605&Format=Detailed",
+                "filename": "202605_8888",
+            }
+            queue = DownloadQueue.from_links([link])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+
+            driver = FakeDriver(download_dir, file_by_url={link["url"]: "report.xlsx"})
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+            )
+
+            engine.run(plan)
+
+            self.assertEqual(item.filename, "202605_8888.xlsx")
+            self.assertTrue((download_dir / "202605_8888.xlsx").exists())
+            self.assertFalse((download_dir / "report.xlsx").exists())
+
+    def test_detects_overwritten_existing_file_as_new_download(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=9999&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+            existing_file = download_dir / "download.xlsx"
+            existing_file.write_text("old", encoding="utf-8")
+
+            class OverwriteDriver:
+                def __init__(self, target_file):
+                    self.target_file = target_file
+                    self.opened_urls = []
+
+                def get(self, requested_url):
+                    self.opened_urls.append(requested_url)
+                    self.target_file.write_text("new", encoding="utf-8")
+
+            driver = OverwriteDriver(existing_file)
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+            )
+
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertTrue((download_dir / "download.xlsx").exists())
 
     def test_summary_counts_terminal_states_and_retried_files(self):
         with TemporaryDirectory() as tmp:
