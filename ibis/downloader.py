@@ -63,14 +63,16 @@ def ensure_download_dir():
     """
     确保下载目录存在。
     """
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    from config import DOWNLOAD_DIR
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_download_dir():
     """
     返回下载目录。
     """
-    ensure_download_dir()
+    from config import DOWNLOAD_DIR
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     return DOWNLOAD_DIR
 
 

@@ -1,4 +1,5 @@
 import unittest
+import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -98,7 +99,7 @@ class DownloaderEngineTests(unittest.TestCase):
 
             self.assertEqual(driver.opened_urls, [item.download_url for item in plan.scheduled_items])
             self.assertEqual([item.download_status for item in plan.scheduled_items], [STATUS_COMPLETED, STATUS_COMPLETED])
-            self.assertEqual([item.filename for item in plan.scheduled_items], ["invoice-1001.pdf", "invoice-1002.pdf"])
+            self.assertEqual([item.filename for item in plan.scheduled_items], ["202605_1001.xlsx", "202605_1002.xlsx"])
 
     def test_status_lifecycle_is_pending_to_downloading_to_completed(self):
         with TemporaryDirectory() as tmp:
@@ -158,7 +159,7 @@ class DownloaderEngineTests(unittest.TestCase):
             expected_urls = [links[0]["url"]] + [links[1]["url"]] * (MAX_RETRIES + 1)
             self.assertEqual(driver.opened_urls, expected_urls)
             self.assertEqual(items[0].download_status, STATUS_COMPLETED)
-            self.assertEqual(items[0].filename, "invoice-3001.pdf")
+            self.assertEqual(items[0].filename, "202605_3001.xlsx")
             self.assertEqual(items[1].download_status, STATUS_FAILED)
             self.assertIsNone(items[1].filename)
             self.assertEqual(items[1].retry_count, MAX_RETRIES)
@@ -192,7 +193,7 @@ class DownloaderEngineTests(unittest.TestCase):
             engine.run(plan)
 
             self.assertEqual(item.download_status, STATUS_COMPLETED)
-            self.assertEqual(item.filename, "invoice-4001.pdf")
+            self.assertEqual(item.filename, "202605_4001.xlsx")
             self.assertEqual(item.retry_count, 1)
             self.assertIn("connection reset", item.last_error)
             # URL is opened twice: initial attempt (fails) + first retry (succeeds).
@@ -496,6 +497,173 @@ class DownloaderEngineTests(unittest.TestCase):
                 ],
             )
             self.assertRegex(printed_lines[-1], r"^Elapsed: \d+\.\d s$")
+
+
+    def test_downloaded_file_is_renamed_to_billing_period_invoice_id_when_no_preset_filename(self):
+        """Downloaded file is renamed to {billing_period}_{invoice_id}.xlsx when item has no preset filename."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=6001&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+            self.assertIsNone(item.filename)
+
+            driver = FakeDriver(download_dir, file_by_url={url: "DownloadARExport.aspx"})
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertEqual(item.filename, "202605_6001.xlsx")
+            self.assertTrue((download_dir / "202605_6001.xlsx").exists())
+            self.assertFalse((download_dir / "DownloadARExport.aspx").exists())
+
+    def test_downloaded_file_is_renamed_using_preset_filename_with_xlsx_extension(self):
+        """Preset filename without extension gets .xlsx appended."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=6002&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url, "filename": "202605_gridname"}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+            self.assertEqual(item.filename, "202605_gridname")
+
+            driver = FakeDriver(download_dir, file_by_url={url: "DownloadARExport.aspx"})
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertEqual(item.filename, "202605_gridname.xlsx")
+            self.assertTrue((download_dir / "202605_gridname.xlsx").exists())
+            self.assertFalse((download_dir / "DownloadARExport.aspx").exists())
+
+    def test_downloaded_file_keeps_name_when_preset_filename_already_has_extension(self):
+        """Preset filename with an extension is used as-is; no rename if it matches the downloaded file."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=6003&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url, "filename": "invoice-6003.pdf"}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+
+            driver = FakeDriver(download_dir, file_by_url={url: "invoice-6003.pdf"})
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertEqual(item.filename, "invoice-6003.pdf")
+            self.assertTrue((download_dir / "invoice-6003.pdf").exists())
+
+    def test_downloaded_file_keeps_original_name_when_no_metadata(self):
+        """When no metadata is available, the downloaded filename is kept unchanged."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+            self.assertIsNone(item.invoice_id)
+            self.assertIsNone(item.billing_period)
+            self.assertIsNone(item.filename)
+
+            driver = FakeDriver(download_dir, file_by_url={url: "download.xlsx"})
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertEqual(item.filename, "download.xlsx")
+            self.assertTrue((download_dir / "download.xlsx").exists())
+
+
+    def test_rename_appends_suffix_when_target_already_exists(self):
+        """When the target filename already exists, a unique _{n} suffix is appended."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=7001&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+
+            # Pre-create the expected target so there is a collision.
+            (download_dir / "202605_7001.xlsx").write_text("existing", encoding="utf-8")
+
+            driver = FakeDriver(download_dir, file_by_url={url: "DownloadARExport.aspx"})
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertEqual(item.filename, "202605_7001_1.xlsx")
+            self.assertTrue((download_dir / "202605_7001_1.xlsx").exists())
+            # Original collision file is untouched.
+            self.assertTrue((download_dir / "202605_7001.xlsx").exists())
+
+    def test_crdownload_completion_waits_for_matching_crdownload_to_disappear(self):
+        """_find_new_completed_file must skip a completed file while its matching
+        .crdownload companion (e.g. invoice.xlsx.crdownload) still exists, and
+        return the file only once the companion is gone."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            existing_files = engine._snapshot_files()
+
+            final_file = download_dir / "invoice.xlsx"
+            crdownload = download_dir / "invoice.xlsx.crdownload"
+            final_file.write_text("data", encoding="utf-8")
+            crdownload.write_text("partial", encoding="utf-8")
+
+            # Companion still present — should not return the final file yet.
+            self.assertIsNone(engine._find_new_completed_file(existing_files))
+
+            # Companion removed — download is complete.
+            crdownload.unlink()
+            self.assertEqual(engine._find_new_completed_file(existing_files), final_file)
+
+    def test_crdownload_file_is_not_renamed(self):
+        """A file with a .crdownload suffix must never be renamed."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            crdownload = download_dir / "partial.crdownload"
+            crdownload.write_text("partial", encoding="utf-8")
+
+            from ibis.downloader import DownloadQueueItem
+            item = DownloadQueueItem(
+                download_url="https://example.com/x",
+                invoice_id="8001",
+                billing_period="202605",
+                filename=None,
+            )
+            result = engine._rename_downloaded_file(crdownload, item)
+
+            self.assertIs(result, crdownload)
+            self.assertTrue(crdownload.exists())
+            self.assertFalse((download_dir / "202605_8001.xlsx").exists())
+
+    def test_rename_failure_issues_warning_and_keeps_original_filename(self):
+        """When the OS rename fails a warning is emitted and the original path is returned."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            original = download_dir / "DownloadARExport.aspx"
+            original.write_text("data", encoding="utf-8")
+
+            from ibis.downloader import DownloadQueueItem
+            item = DownloadQueueItem(
+                download_url="https://example.com/x",
+                invoice_id="9001",
+                billing_period="202605",
+                filename=None,
+            )
+
+            with patch.object(Path, "rename", side_effect=OSError("permission denied")), \
+                 warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = engine._rename_downloaded_file(original, item)
+
+            self.assertIs(result, original)
+            self.assertEqual(len(caught), 1)
+            self.assertIn("permission denied", str(caught[0].message))
+            self.assertIn("202605_9001.xlsx", str(caught[0].message))
 
 
 if __name__ == "__main__":
