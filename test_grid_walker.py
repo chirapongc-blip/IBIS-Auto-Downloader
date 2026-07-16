@@ -170,6 +170,100 @@ class GridWalkerTests(unittest.TestCase):
 
         self.assertEqual(len(links), 2)
 
+    def test_raises_when_page_navigation_loops(self):
+        """collect_grid_download_links must raise if the pager returns the
+        same page number twice (infinite-loop guard)."""
+
+        class StuckDriver(FakeDriver):
+            """Returns the next-button element but navigation never advances
+            the page, so pager_info always reports page 1."""
+
+            def find_elements(self, by, selector):
+                if "GVPagerOnClick" in selector:
+                    return [FakeElement(f"ASPx.GVPagerOnClick('{GRID_ID}','PBN');")]
+                return []
+
+            def execute_script(self, script, *args):
+                pass  # navigation no-op – page index never advances
+
+        pages = [build_page(1, 2, [1001])]
+        driver = StuckDriver(pages)
+
+        class AlwaysTrueWait:
+            def __init__(self, driver, timeout):
+                pass
+
+            def until(self, method):
+                return True  # pretend the page advanced
+
+        with patch("ibis.grid_walker.wait_for_grid", return_value=None), \
+             patch("ibis.grid_walker.WebDriverWait", AlwaysTrueWait):
+            with self.assertRaises(RuntimeError) as ctx:
+                collect_grid_download_links(
+                    driver, "https://stationsatcom.satcomhost.com"
+                )
+
+        self.assertIn("repeated page", str(ctx.exception))
+
+    def test_raises_when_next_button_not_in_dom(self):
+        """RuntimeError is raised when the pager HTML indicates a next page
+        but the next-page element cannot be found in the live DOM."""
+
+        class NoDomNextDriver:
+            """Page source always shows page 1 of 2, but find_elements returns
+            nothing (next button missing from live DOM)."""
+
+            @property
+            def page_source(self):
+                return build_page(1, 2, [1001])
+
+            def find_elements(self, by, selector):
+                return []  # next button absent from DOM
+
+            def execute_script(self, script, *args):
+                pass
+
+        driver = NoDomNextDriver()
+
+        with patch("ibis.grid_walker.wait_for_grid", return_value=None), \
+             patch("ibis.grid_walker.WebDriverWait", ImmediateWait):
+            with self.assertRaises(RuntimeError) as ctx:
+                collect_grid_download_links(
+                    driver, "https://stationsatcom.satcomhost.com"
+                )
+
+        self.assertIn("PBN", str(ctx.exception))
+
+    def test_collects_single_page_with_no_pager(self):
+        """When there is no pager, all links on the sole page are returned."""
+        html = (
+            f'<html><body>'
+            f'<table id="{GRID_ID}">'
+            f'<tr><td>'
+            f'<a href="DownloadARExport.aspx?InvoiceID=9001&Format=Detailed">xls</a>'
+            f'</td></tr>'
+            f'</table></body></html>'
+        )
+
+        class SinglePageDriver:
+            @property
+            def page_source(self):
+                return html
+
+            def find_elements(self, by, selector):
+                return []
+
+        driver = SinglePageDriver()
+
+        with patch("ibis.grid_walker.wait_for_grid", return_value=None), \
+             patch("ibis.grid_walker.WebDriverWait", ImmediateWait):
+            links = collect_grid_download_links(
+                driver, "https://stationsatcom.satcomhost.com"
+            )
+
+        self.assertEqual(len(links), 1)
+        self.assertIn("InvoiceID=9001", links[0]["url"])
+
 
 if __name__ == "__main__":
     unittest.main()
