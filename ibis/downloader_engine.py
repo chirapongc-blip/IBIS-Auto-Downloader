@@ -1,8 +1,11 @@
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import re
+from urllib.parse import urlparse
 
 from ibis.downloader import get_download_dir, STATUS_PENDING
+from selenium.common.exceptions import WebDriverException
 
 
 STATUS_DOWNLOADING = "downloading"
@@ -10,6 +13,7 @@ STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
 _INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp")
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 MAX_RETRIES = 3
 
@@ -76,8 +80,9 @@ class DownloaderEngine:
         self._set_status(item, STATUS_DOWNLOADING)
 
         for attempt in range(MAX_RETRIES + 1):
-            existing_files = self._snapshot_files()
+            existing_files = self._snapshot_file_state()
             try:
+                self._validate_download_url(item.download_url)
                 self.driver.get(item.download_url)
                 downloaded_file = self._wait_for_download(existing_files)
 
@@ -90,33 +95,44 @@ class DownloaderEngine:
                         f"Download file missing for URL: {item.download_url}"
                     )
 
+                downloaded_file = self._rename_downloaded_file(item, downloaded_file)
                 item.filename = downloaded_file.name
                 self._finalize_item(item, STATUS_COMPLETED)
                 return
 
             except Exception as exc:
-                item.last_error = str(exc)
-                if not is_retryable(exc) or attempt == MAX_RETRIES:
+                normalized_error = self._normalize_download_error(exc)
+                item.last_error = str(normalized_error)
+                if not is_retryable(normalized_error) or attempt == MAX_RETRIES:
                     break
                 item.retry_count += 1
 
         self._finalize_item(item, STATUS_FAILED)
 
-    def _wait_for_download(self, existing_files):
+    def _wait_for_download(self, existing_files: dict[Path, tuple[int, int]]):
         deadline = time.monotonic() + self.timeout
 
         while time.monotonic() < deadline:
-            downloaded_file = self._find_new_completed_file(existing_files)
+            current_files = self._snapshot_file_state()
+            if self._has_active_incomplete_downloads(existing_files, current_files):
+                time.sleep(self.poll_interval)
+                continue
+
+            downloaded_file = self._find_new_completed_file(existing_files, current_files)
             if downloaded_file is not None:
                 return downloaded_file
             time.sleep(self.poll_interval)
 
         return None
 
-    def _find_new_completed_file(self, existing_files):
+    def _find_new_completed_file(
+        self,
+        existing_files: dict[Path, tuple[int, int]],
+        current_files: dict[Path, tuple[int, int]],
+    ):
         for file_path in sorted(
-            self._snapshot_files() - existing_files,
-            key=lambda path: path.stat().st_mtime,
+            self._collect_changed_files(existing_files, current_files),
+            key=lambda path: current_files[path][0],
             reverse=True,
         ):
             if file_path.suffix.lower() in _INCOMPLETE_SUFFIXES:
@@ -124,9 +140,74 @@ class DownloaderEngine:
             return file_path
         return None
 
-    def _snapshot_files(self):
+    def _snapshot_file_state(self):
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        return {path for path in self.download_dir.iterdir() if path.is_file()}
+        state = {}
+        for path in self.download_dir.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                stats = path.stat()
+            except FileNotFoundError:
+                continue
+            state[path] = (stats.st_mtime_ns, stats.st_size)
+        return state
+
+    def _collect_changed_files(self, existing_files, current_files):
+        changed = []
+        for path, current_state in current_files.items():
+            previous_state = existing_files.get(path)
+            if previous_state is None or previous_state != current_state:
+                changed.append(path)
+        return changed
+
+    def _has_active_incomplete_downloads(self, existing_files, current_files):
+        for path in self._collect_changed_files(existing_files, current_files):
+            if path.suffix.lower() in _INCOMPLETE_SUFFIXES:
+                return True
+        return False
+
+    def _rename_downloaded_file(self, item, downloaded_file: Path):
+        target_path = self.download_dir / self._build_target_filename(item, downloaded_file)
+        if target_path == downloaded_file:
+            return downloaded_file
+        if target_path.exists():
+            raise DuplicateFileError(f"File already exists: {target_path.name}")
+        return downloaded_file.rename(target_path)
+
+    def _build_target_filename(self, item, downloaded_file: Path):
+        extension = downloaded_file.suffix or ".xlsx"
+        stem = self._build_target_stem(item, downloaded_file)
+        if stem.lower().endswith(extension.lower()):
+            return stem
+        return f"{stem}{extension}"
+
+    def _build_target_stem(self, item, downloaded_file: Path):
+        if item.filename:
+            return self._sanitize_filename(Path(item.filename).stem)
+        return self._sanitize_filename(downloaded_file.stem)
+
+    def _sanitize_filename(self, value: str):
+        normalized = _SAFE_FILENAME_RE.sub("_", value).strip("._-")
+        return normalized or "invoice_download"
+
+    def _validate_download_url(self, url: str):
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise InvalidUrlError(f"invalid URL: {url}")
+
+    def _normalize_download_error(self, exc: Exception):
+        if isinstance(exc, DownloadError):
+            return exc
+        if isinstance(exc, WebDriverException):
+            message = str(exc)
+            lower_message = message.lower()
+            if "404" in lower_message:
+                return Http404Error(message)
+            if "invalid" in lower_message and "url" in lower_message:
+                return InvalidUrlError(message)
+            return TemporaryBrowserError(message)
+        return exc
 
     def _set_status(self, item, status):
         item.download_status = status
