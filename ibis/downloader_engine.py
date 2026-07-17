@@ -1,5 +1,6 @@
 import time
 import warnings
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,8 @@ STATUS_SKIPPED = "skipped"
 _INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp")
 
 MAX_RETRIES = 3
+DEBUG_DOWNLOAD_DIAGNOSTICS = False
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -65,6 +68,26 @@ class DownloaderEngine:
         self.poll_interval = poll_interval
         self.summary = DownloadSummary()
 
+    def _debug(self, message, **fields):
+        if not DEBUG_DOWNLOAD_DIAGNOSTICS:
+            return
+        if fields:
+            # lgtm[py/clear-text-logging-sensitive-data]
+            LOGGER.debug("%s | %s", message, ", ".join(f"{k}={v}" for k, v in fields.items()))
+            return
+        LOGGER.debug("%s", message)
+
+    @staticmethod
+    def _format_path_set(paths):
+        return [str(path) for path in sorted(paths)]
+
+    @staticmethod
+    def _format_stats(stats):
+        return {
+            str(path): {"mtime": mtime, "size": size}
+            for path, (mtime, size) in sorted(stats.items(), key=lambda item: str(item[0]))
+        }
+
     def run(self, plan):
         self.summary = DownloadSummary(total_files=len(plan.scheduled_items))
         started_at = time.monotonic()
@@ -79,6 +102,16 @@ class DownloaderEngine:
         for attempt in range(MAX_RETRIES + 1):
             existing_files = self._snapshot_files()
             existing_stats = self._snapshot_file_stats(existing_files)
+            target_name = self._build_target_filename(item)
+            self._debug(
+                "Download attempt started",
+                attempt=attempt + 1,
+                max_attempts=MAX_RETRIES + 1,
+                invoice_id=item.invoice_id,
+                target_filename=target_name or item.filename,
+                existing_files=self._format_path_set(existing_files),
+                existing_stats=self._format_stats(existing_stats),
+            )
             try:
                 self.driver.get(item.download_url)
                 downloaded_file = self._wait_for_download(existing_files, existing_stats)
@@ -94,15 +127,34 @@ class DownloaderEngine:
 
                 renamed = self._rename_downloaded_file(downloaded_file, item)
                 item.filename = renamed.name
+                self._debug(
+                    "Download attempt completed",
+                    attempt=attempt + 1,
+                    selected_file=str(downloaded_file),
+                    final_file=str(renamed),
+                )
                 self._finalize_item(item, STATUS_COMPLETED)
                 return
 
             except Exception as exc:
                 item.last_error = str(exc)
+                should_retry = is_retryable(exc) and attempt < MAX_RETRIES
+                if should_retry:
+                    self._debug(
+                        "Retry scheduled",
+                        attempt=attempt + 1,
+                        reason=str(exc),
+                    )
                 if not is_retryable(exc) or attempt == MAX_RETRIES:
                     break
                 item.retry_count += 1
 
+        self._debug(
+            "Download failed",
+            invoice_id=item.invoice_id,
+            target_filename=item.filename or self._build_target_filename(item),
+            final_failure_reason=item.last_error,
+        )
         self._finalize_item(item, STATUS_FAILED)
 
     def _wait_for_download(self, existing_files, existing_stats=None):
@@ -111,29 +163,48 @@ class DownloaderEngine:
         while time.monotonic() < deadline:
             downloaded_file = self._find_new_completed_file(existing_files)
             if downloaded_file is not None:
+                self._debug(
+                    "Primary detection succeeded",
+                    primary_success=True,
+                    secondary_entered=False,
+                    selected_file=str(downloaded_file),
+                )
                 return downloaded_file
             time.sleep(self.poll_interval)
 
         # Primary 'new file' detection timed out.  Only then try the secondary
         # path: look for an existing file that was atomically overwritten.
+        self._debug("Primary detection timed out", primary_success=False, secondary_entered=bool(existing_stats))
         if existing_stats:
-            return self._find_overwritten_file(existing_stats)
+            selected_file = self._find_overwritten_file(existing_stats)
+            self._debug(
+                "Secondary detection completed",
+                secondary_entered=True,
+                selected_file=str(selected_file) if selected_file else None,
+            )
+            return selected_file
         return None
 
     def _find_new_completed_file(self, existing_files):
         current_files = self._snapshot_files()
+        new_files = current_files - existing_files
+        self._debug("Primary detection scan", new_files=self._format_path_set(new_files))
+        candidates = []
         for file_path in sorted(
-            current_files - existing_files,
+            new_files,
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         ):
+            candidates.append(str(file_path))
             if file_path.suffix.lower() in _INCOMPLETE_SUFFIXES:
                 continue
             # Skip if the matching .crdownload companion still exists — the
             # browser hasn't finished writing the file yet.
             if (file_path.parent / (file_path.name + ".crdownload")) in current_files:
                 continue
+            self._debug("Primary detection selected candidate", candidates=candidates, selected_file=str(file_path))
             return file_path
+        self._debug("Primary detection found no candidate", candidates=candidates, selected_file=None)
         return None
 
     def _snapshot_file_stats(self, file_set):
@@ -162,19 +233,41 @@ class DownloaderEngine:
         'new file' detection loop has already timed out; it must never replace
         that primary path.
         """
+        candidates = []
         for path, (old_mtime, old_size) in existing_stats.items():
+            candidate_data = {
+                "path": str(path),
+                "old_mtime": old_mtime,
+                "old_size": old_size,
+            }
             if path.suffix.lower() in _INCOMPLETE_SUFFIXES:
+                candidate_data["skipped"] = "incomplete_suffix"
+                candidates.append(candidate_data)
                 continue
             try:
                 st = path.stat()
             except OSError:
+                candidate_data["skipped"] = "stat_error"
+                candidates.append(candidate_data)
                 continue
+            candidate_data["new_mtime"] = st.st_mtime
+            candidate_data["new_size"] = st.st_size
+            candidate_data["mtime_changed"] = st.st_mtime != old_mtime
+            candidate_data["size_changed"] = st.st_size != old_size
             if st.st_mtime == old_mtime or st.st_size == old_size:
+                candidate_data["skipped"] = "missing_required_change"
+                candidates.append(candidate_data)
                 continue
             # Also skip while a .crdownload companion is present.
             if (path.parent / (path.name + ".crdownload")).exists():
+                candidate_data["skipped"] = "companion_crdownload_exists"
+                candidates.append(candidate_data)
                 continue
+            candidate_data["selected"] = True
+            candidates.append(candidate_data)
+            self._debug("Secondary detection selected candidate", candidates=candidates, selected_file=str(path))
             return path
+        self._debug("Secondary detection found no candidate", candidates=candidates, selected_file=None)
         return None
 
     def _build_target_filename(self, item) -> str | None:
@@ -202,9 +295,19 @@ class DownloaderEngine:
 
         target_name = self._build_target_filename(item)
         if target_name is None or target_name == downloaded_file.name:
+            self._debug(
+                "Rename skipped",
+                source_path=str(downloaded_file),
+                target_path=str(downloaded_file),
+            )
             return downloaded_file
 
         target_path = self._unique_path(downloaded_file.parent / target_name)
+        self._debug(
+            "Renaming downloaded file",
+            source_path=str(downloaded_file),
+            target_path=str(target_path),
+        )
         try:
             downloaded_file.rename(target_path)
             return target_path
