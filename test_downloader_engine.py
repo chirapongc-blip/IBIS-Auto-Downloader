@@ -1,3 +1,5 @@
+import os
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -605,6 +607,7 @@ class DownloaderEngineTests(unittest.TestCase):
             download_dir = Path(tmp)
             engine = DownloaderEngine(driver=None, download_dir=download_dir)
             existing_files = engine._snapshot_files()
+            snapshot_time = time.time() - 1
 
             final_file = download_dir / "invoice.xlsx"
             crdownload = download_dir / "invoice.xlsx.crdownload"
@@ -612,11 +615,11 @@ class DownloaderEngineTests(unittest.TestCase):
             crdownload.write_text("partial", encoding="utf-8")
 
             # Companion still present — should not return the final file yet.
-            self.assertIsNone(engine._find_new_completed_file(existing_files))
+            self.assertIsNone(engine._find_new_completed_file(existing_files, snapshot_time))
 
             # Companion removed — download is complete.
             crdownload.unlink()
-            self.assertEqual(engine._find_new_completed_file(existing_files), final_file)
+            self.assertEqual(engine._find_new_completed_file(existing_files, snapshot_time), final_file)
 
     def test_crdownload_file_is_not_renamed(self):
         """A file with a .crdownload suffix must never be renamed."""
@@ -639,31 +642,118 @@ class DownloaderEngineTests(unittest.TestCase):
             self.assertTrue(crdownload.exists())
             self.assertFalse((download_dir / "202605_8001.xlsx").exists())
 
-    def test_rename_failure_issues_warning_and_keeps_original_filename(self):
-        """When the OS rename fails a warning is emitted and the original path is returned."""
+    def test_prior_item_renamed_file_not_picked_up_for_next_item(self):
+        """A file renamed by item N-1 must NOT be returned as item N's download.
+
+        Regression: when snapshot_time was captured before driver.get(), the
+        just-renamed file had mtime >= snapshot_time and was falsely returned as
+        the newly downloaded file for the next item.
+        """
         with TemporaryDirectory() as tmp:
             download_dir = Path(tmp)
             engine = DownloaderEngine(driver=None, download_dir=download_dir)
-            original = download_dir / "DownloadARExport.aspx"
-            original.write_text("data", encoding="utf-8")
 
-            from ibis.downloader import DownloadQueueItem
-            item = DownloadQueueItem(
-                download_url="https://example.com/x",
-                invoice_id="9001",
-                billing_period="202605",
-                filename=None,
-            )
+            # Simulate item N-1's renamed file sitting in the directory.
+            prior_file = download_dir / "202605_24518.xlsx"
+            prior_file.write_text("prior", encoding="utf-8")
 
-            with patch.object(Path, "rename", side_effect=OSError("permission denied")), \
-                 warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                result = engine._rename_downloaded_file(original, item)
+            # snapshot_time is set AFTER driver.get() — it is strictly later
+            # than any file written before the download was triggered.
+            existing_files = engine._snapshot_files()
+            snapshot_time = time.time()
 
-            self.assertIs(result, original)
-            self.assertEqual(len(caught), 1)
-            self.assertIn("permission denied", str(caught[0].message))
-            self.assertIn("202605_9001.xlsx", str(caught[0].message))
+            # Force the prior file's mtime to a value BEFORE snapshot_time.
+            old_mtime = snapshot_time - 0.5
+            os.utime(prior_file, (old_mtime, old_mtime))
+
+            # No new file has appeared; prior_file pre-dates snapshot_time.
+            self.assertIsNone(engine._find_new_completed_file(existing_files, snapshot_time))
+
+    def test_existing_file_with_old_mtime_not_returned_as_download(self):
+        """An existing file modified before snapshot_time is ignored even if
+        it happens to be in existing_files — only new or overwritten files count."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+
+            stale_file = download_dir / "202605_26719.xlsx"
+            stale_file.write_text("old content", encoding="utf-8")
+
+            existing_files = engine._snapshot_files()
+            snapshot_time = time.time() + 1  # future timestamp simulates strict post-trigger boundary
+
+            # stale_file mtime predates snapshot_time → must not be a candidate.
+            self.assertIsNone(engine._find_new_completed_file(existing_files, snapshot_time))
+
+    def test_detects_existing_file_atomically_replaced_after_snapshot_time(self):
+        """An existing filename overwritten in-place by Chrome after snapshot_time
+        must be detected via the mtime check."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=9101&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            from ibis.scheduler import DownloadPlan
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+
+            existing_file = download_dir / "DownloadARExport.aspx"
+            existing_file.write_text("old", encoding="utf-8")
+
+            class AtomicReplaceDriver:
+                """Overwrites existing_file in place and sets mtime after trigger."""
+
+                def __init__(self, target_file: Path):
+                    self.target_file = target_file
+                    self.opened_urls = []
+
+                def get(self, current_url):
+                    self.opened_urls.append(current_url)
+                    self.target_file.write_text("new", encoding="utf-8")
+                    future_mtime = time.time() + 1
+                    os.utime(self.target_file, (future_mtime, future_mtime))
+
+            driver = AtomicReplaceDriver(existing_file)
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertEqual(item.filename, "202605_9101.xlsx")
+            self.assertTrue((download_dir / "202605_9101.xlsx").exists())
+            self.assertEqual(driver.opened_urls, [url])
+
+    def test_sequential_downloads_each_get_correct_file(self):
+        """When multiple items download back-to-back with rapid timing, each item
+        must complete with its own file and no item must steal a prior item's file.
+
+        This is the core regression guard: Build 2.2 had 35/35 completions; the
+        broken PR #14 produced 6 failures because recently renamed files from
+        prior items were picked up as new downloads for the next item.
+        """
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            links = [
+                {"url": f"https://example.com/DownloadARExport.aspx?InvoiceID={inv}&BillingPeriod=202605&Format=Detailed"}
+                for inv in [24518, 26719, 22613, 22338, 21042, 20014]
+            ]
+            queue = DownloadQueue.from_links(links)
+            from ibis.scheduler import DownloadPlan
+            plan = DownloadPlan(queue)
+
+            # Each URL produces a uniquely named download file.
+            file_by_url = {
+                link["url"]: f"DownloadARExport_{i}.aspx"
+                for i, link in enumerate(links)
+            }
+            driver = FakeDriver(download_dir, file_by_url=file_by_url)
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(engine.summary.completed, 6)
+            self.assertEqual(engine.summary.failed, 0)
+            invoice_ids = [str(link["url"]).split("InvoiceID=")[1].split("&")[0] for link in links]
+            for inv_id, item in zip(invoice_ids, plan.scheduled_items):
+                self.assertEqual(item.download_status, STATUS_COMPLETED)
+                self.assertEqual(item.filename, f"202605_{inv_id}.xlsx")
 
 
 if __name__ == "__main__":
