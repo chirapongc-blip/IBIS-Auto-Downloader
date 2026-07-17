@@ -99,6 +99,9 @@ class DownloaderEngine:
     def _download_item(self, item):
         self._set_status(item, STATUS_PENDING)
         self._set_status(item, STATUS_DOWNLOADING)
+        success = False
+        downloaded_file = None
+        renamed = None
 
         for attempt in range(MAX_RETRIES + 1):
             existing_files = self._snapshot_files()
@@ -128,14 +131,8 @@ class DownloaderEngine:
 
                 renamed = self._rename_downloaded_file(downloaded_file, item)
                 item.filename = renamed.name
-                self._debug(
-                    "Download attempt completed",
-                    attempt=attempt + 1,
-                    selected_file=str(downloaded_file),
-                    final_file=str(renamed),
-                )
-                self._finalize_item(item, STATUS_COMPLETED)
-                return
+                success = True
+                break
 
             except Exception as exc:
                 item.last_error = str(exc)
@@ -150,13 +147,22 @@ class DownloaderEngine:
                     break
                 item.retry_count += 1
 
-        self._debug(
-            "Download failed",
-            invoice_id=item.invoice_id,
-            target_filename=item.filename or self._build_target_filename(item),
-            final_failure_reason=item.last_error,
-        )
-        self._finalize_item(item, STATUS_FAILED)
+        if success:
+            self._debug(
+                "Download attempt completed",
+                attempt=attempt + 1,
+                selected_file=str(downloaded_file),
+                final_file=str(renamed),
+            )
+            self._finalize_item(item, STATUS_COMPLETED)
+        else:
+            self._debug(
+                "Download failed",
+                invoice_id=item.invoice_id,
+                target_filename=item.filename or self._build_target_filename(item),
+                final_failure_reason=item.last_error,
+            )
+            self._finalize_item(item, STATUS_FAILED)
 
     def _wait_for_download(self, existing_files, existing_stats=None):
         deadline = time.monotonic() + self.timeout
