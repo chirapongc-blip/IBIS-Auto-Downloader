@@ -72,10 +72,9 @@ class DownloaderEngine:
         if not DEBUG_DOWNLOAD_DIAGNOSTICS:
             return
         if fields:
-            # lgtm[py/clear-text-logging-sensitive-data]
-            LOGGER.debug("%s | %s", message, ", ".join(f"{k}={v}" for k, v in fields.items()))
+            print(f"[DEBUG] {message} | {', '.join(f'{k}={v}' for k, v in fields.items())}")
             return
-        LOGGER.debug("%s", message)
+        print(f"[DEBUG] {message}")
 
     @staticmethod
     def _format_path_set(paths):
