@@ -71,10 +71,12 @@ class DownloaderEngine:
     def _debug(self, message, **fields):
         if not DEBUG_DOWNLOAD_DIAGNOSTICS:
             return
+        payload = f"{message} | {', '.join(f'{k}={v}' for k, v in fields.items())}" if fields else message
+        print(f"[DEBUG] {payload}", flush=True)
         if fields:
-            print(f"[DEBUG] {message} | {', '.join(f'{k}={v}' for k, v in fields.items())}")
+            LOGGER.debug("%s | %s", message, ", ".join(f"{k}={v}" for k, v in fields.items()))
             return
-        print(f"[DEBUG] {message}")
+        LOGGER.debug("%s", message)
 
     @staticmethod
     def _format_path_set(paths):
