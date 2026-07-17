@@ -369,6 +369,34 @@ class DownloaderEngineTests(unittest.TestCase):
             statuses = [call.args[1] for call in mocked.call_args_list if call.args[0] is item]
             self.assertEqual(statuses, [STATUS_PENDING, STATUS_DOWNLOADING, STATUS_FAILED])
 
+    def test_summary_completed_not_failed_when_last_retry_succeeds(self):
+        """summary.completed is incremented and summary.failed stays 0 when all
+        retries fail but the final attempt succeeds."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=5010&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+
+            # Fail on all but the very last allowed attempt, then succeed.
+            driver = FlakeyDriver(
+                download_dir,
+                file_by_url={url: "invoice-5010.pdf"},
+                exc_by_url={url: [TemporaryBrowserError("transient")] * MAX_RETRIES},
+            )
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+            )
+            engine.run(plan)
+
+            self.assertEqual(plan.scheduled_items[0].download_status, STATUS_COMPLETED)
+            self.assertEqual(engine.summary.completed, 1)
+            self.assertEqual(engine.summary.failed, 0)
+            self.assertEqual(engine.summary.retried, 1)
+
     def test_summary_counts_terminal_states_and_retried_files(self):
         with TemporaryDirectory() as tmp:
             download_dir = Path(tmp)
