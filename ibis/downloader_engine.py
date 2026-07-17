@@ -1,6 +1,7 @@
 import time
 import warnings
 import logging
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
 _INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp")
+_TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_SKIPPED}
 
 MAX_RETRIES = 3
 DEBUG_DOWNLOAD_DIAGNOSTICS = False
@@ -99,11 +101,30 @@ class DownloaderEngine:
     def _download_item(self, item):
         self._set_status(item, STATUS_PENDING)
         self._set_status(item, STATUS_DOWNLOADING)
+        last_traceback = None
+        last_attempt_details = {
+            "attempt": None,
+            "browser_action": "not_started",
+            "download_detection": "not_started",
+            "selected_file": None,
+            "rename_result": "not_started",
+            "final_file": None,
+            "http_response": None,
+        }
 
         for attempt in range(MAX_RETRIES + 1):
             existing_files = self._snapshot_files()
             existing_stats = self._snapshot_file_stats(existing_files)
             target_name = self._build_target_filename(item)
+            last_attempt_details = {
+                "attempt": attempt + 1,
+                "browser_action": "pending",
+                "download_detection": "pending",
+                "selected_file": None,
+                "rename_result": "pending",
+                "final_file": None,
+                "http_response": None,
+            }
             self._debug(
                 "Download attempt started",
                 attempt=attempt + 1,
@@ -114,20 +135,29 @@ class DownloaderEngine:
                 existing_stats=self._format_stats(existing_stats),
             )
             try:
+                last_attempt_details["browser_action"] = "driver.get"
                 self.driver.get(item.download_url)
+                last_attempt_details["browser_action"] = "driver.get_ok"
                 downloaded_file = self._wait_for_download(existing_files, existing_stats)
 
                 if downloaded_file is None:
+                    last_attempt_details["download_detection"] = "timeout_no_file"
                     raise DownloadTimeoutError(
                         f"Download timed out for URL: {item.download_url}"
                     )
+                last_attempt_details["selected_file"] = str(downloaded_file)
                 if not downloaded_file.exists():
+                    last_attempt_details["download_detection"] = "selected_file_missing"
                     raise IncompleteDownloadError(
                         f"Download file missing for URL: {item.download_url}"
                     )
+                last_attempt_details["download_detection"] = "selected_file_exists"
 
+                last_attempt_details["rename_result"] = "renaming"
                 renamed = self._rename_downloaded_file(downloaded_file, item)
                 item.filename = renamed.name
+                last_attempt_details["rename_result"] = "renamed"
+                last_attempt_details["final_file"] = str(renamed)
                 self._debug(
                     "Download attempt completed",
                     attempt=attempt + 1,
@@ -139,6 +169,11 @@ class DownloaderEngine:
 
             except Exception as exc:
                 item.last_error = str(exc)
+                last_traceback = traceback.format_exc()
+                if last_attempt_details["rename_result"] == "pending":
+                    last_attempt_details["rename_result"] = "not_reached"
+                if last_attempt_details["download_detection"] == "pending":
+                    last_attempt_details["download_detection"] = "exception_before_detection"
                 should_retry = is_retryable(exc) and attempt < MAX_RETRIES
                 if should_retry:
                     self._debug(
@@ -150,6 +185,7 @@ class DownloaderEngine:
                     break
                 item.retry_count += 1
 
+        self._emit_failure_diagnostics(item, last_attempt_details, last_traceback)
         self._debug(
             "Download failed",
             invoice_id=item.invoice_id,
@@ -157,6 +193,30 @@ class DownloaderEngine:
             final_failure_reason=item.last_error,
         )
         self._finalize_item(item, STATUS_FAILED)
+
+    def _emit_failure_diagnostics(self, item, attempt_details, tb_text):
+        http_response = attempt_details.get("http_response") if attempt_details else None
+        if http_response is None:
+            http_response = "unavailable"
+        lines = [
+            "Download failure diagnostics",
+            f"invoice_id={item.invoice_id}",
+            f"download_url={item.download_url}",
+            f"attempt={attempt_details.get('attempt') if attempt_details else None}",
+            f"http_response={http_response}",
+            f"browser_action={attempt_details.get('browser_action') if attempt_details else None}",
+            f"download_detection={attempt_details.get('download_detection') if attempt_details else None}",
+            f"selected_file={attempt_details.get('selected_file') if attempt_details else None}",
+            f"rename_result={attempt_details.get('rename_result') if attempt_details else None}",
+            f"final_file={attempt_details.get('final_file') if attempt_details else None}",
+            f"last_error={item.last_error}",
+        ]
+        if tb_text:
+            lines.append("traceback=")
+            lines.append(tb_text.rstrip())
+        payload = "\n".join(lines)
+        LOGGER.error("%s", payload)
+        print(payload)
 
     def _wait_for_download(self, existing_files, existing_stats=None):
         deadline = time.monotonic() + self.timeout
@@ -191,11 +251,16 @@ class DownloaderEngine:
         new_files = current_files - existing_files
         self._debug("Primary detection scan", new_files=self._format_path_set(new_files))
         candidates = []
-        for file_path in sorted(
-            new_files,
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        ):
+        sortable_files = []
+        for path in new_files:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                # Browser temp artifacts can disappear between snapshot and stat.
+                continue
+            sortable_files.append((mtime, path))
+
+        for _, file_path in sorted(sortable_files, key=lambda item: item[0], reverse=True):
             candidates.append(str(file_path))
             # Skip hidden files (e.g. Chrome temp files like .com.google.Chrome.XXXXX)
             if file_path.name.startswith("."):
@@ -205,6 +270,10 @@ class DownloaderEngine:
             # Skip if the matching .crdownload companion still exists — the
             # browser hasn't finished writing the file yet.
             if (file_path.parent / (file_path.name + ".crdownload")) in current_files:
+                continue
+            try:
+                file_path.stat()
+            except OSError:
                 continue
             self._debug("Primary detection selected candidate", candidates=candidates, selected_file=str(file_path))
             return file_path
@@ -346,6 +415,19 @@ class DownloaderEngine:
         item.download_status = status
 
     def _finalize_item(self, item, status):
+        previous_status = getattr(item, "download_status", None)
+        if previous_status == status:
+            terminal_count = self.summary.completed + self.summary.failed + self.summary.skipped
+            print(f"[{terminal_count}/{self.summary.total_files}] {status.title()} {self._item_label(item)}")
+            return
+
+        if previous_status == STATUS_COMPLETED:
+            self.summary.completed -= 1
+        elif previous_status == STATUS_FAILED:
+            self.summary.failed -= 1
+        elif previous_status == STATUS_SKIPPED:
+            self.summary.skipped -= 1
+
         self._set_status(item, status)
         if status == STATUS_COMPLETED:
             self.summary.completed += 1
@@ -354,7 +436,7 @@ class DownloaderEngine:
         elif status == STATUS_SKIPPED:
             self.summary.skipped += 1
 
-        if item.retry_count > 0:
+        if item.retry_count > 0 and previous_status not in _TERMINAL_STATUSES:
             self.summary.retried += 1
 
         terminal_count = self.summary.completed + self.summary.failed + self.summary.skipped

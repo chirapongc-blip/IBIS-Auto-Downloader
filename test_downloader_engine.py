@@ -1,6 +1,7 @@
 import unittest
 import warnings
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -475,7 +476,10 @@ class DownloaderEngineTests(unittest.TestCase):
                 engine.run(plan)
 
             printed_lines = [call.args[0] for call in mocked_print.call_args_list]
-            progress_lines = [line for line in printed_lines if line.startswith("[")]
+            progress_lines = [
+                line for line in printed_lines
+                if re.match(r"^\[\d+/\d+\] ", line)
+            ]
             self.assertEqual(
                 progress_lines,
                 [
