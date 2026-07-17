@@ -666,5 +666,179 @@ class DownloaderEngineTests(unittest.TestCase):
             self.assertIn("202605_9001.xlsx", str(caught[0].message))
 
 
+class OverwriteDetectionTests(unittest.TestCase):
+    """Tests for the secondary 'atomically overwritten file' detection path."""
+
+    def test_find_overwritten_file_detects_both_mtime_and_size_changed(self):
+        """_find_overwritten_file returns a file whose mtime AND size both differ."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+
+            existing = download_dir / "report.xlsx"
+            existing.write_bytes(b"old content")  # 11 bytes
+
+            existing_stats = engine._snapshot_file_stats({existing})
+
+            # Overwrite: different content → different size, and force mtime change.
+            existing.write_bytes(b"new longer content here")  # 23 bytes
+            # Manually bump mtime in case filesystem resolution is coarse.
+            st = existing.stat()
+            import os
+            os.utime(existing, (st.st_atime, st.st_mtime + 2))
+
+            result = engine._find_overwritten_file(existing_stats)
+            self.assertEqual(result, existing)
+
+    def test_find_overwritten_file_ignores_mtime_only_change(self):
+        """_find_overwritten_file must NOT return a file whose size is unchanged."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+
+            existing = download_dir / "report.xlsx"
+            content = b"same size content"
+            existing.write_bytes(content)
+
+            existing_stats = engine._snapshot_file_stats({existing})
+
+            # Rewrite with identical size; bump mtime only.
+            existing.write_bytes(content)
+            import os
+            st = existing.stat()
+            os.utime(existing, (st.st_atime, st.st_mtime + 2))
+
+            result = engine._find_overwritten_file(existing_stats)
+            self.assertIsNone(result)
+
+    def test_find_overwritten_file_ignores_size_only_change(self):
+        """_find_overwritten_file must NOT return a file whose mtime is unchanged."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+
+            existing = download_dir / "report.xlsx"
+            existing.write_bytes(b"short")
+
+            existing_stats = engine._snapshot_file_stats({existing})
+
+            # Change size but keep the exact same mtime via utime.
+            st = existing.stat()
+            existing.write_bytes(b"longer content here")
+            import os
+            os.utime(existing, (st.st_atime, st.st_mtime))
+
+            result = engine._find_overwritten_file(existing_stats)
+            self.assertIsNone(result)
+
+    def test_find_overwritten_file_skips_incomplete_suffixes(self):
+        """_find_overwritten_file must never return a .crdownload / .part / .tmp file."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            import os
+
+            for suffix in (".crdownload", ".part", ".tmp"):
+                incomplete = download_dir / f"file{suffix}"
+                incomplete.write_bytes(b"old")
+                stats = engine._snapshot_file_stats({incomplete})
+                incomplete.write_bytes(b"new longer content")
+                st = incomplete.stat()
+                os.utime(incomplete, (st.st_atime, st.st_mtime + 2))
+                self.assertIsNone(
+                    engine._find_overwritten_file(stats),
+                    msg=f"Expected None for {suffix} file",
+                )
+
+    def test_find_overwritten_file_skips_while_crdownload_companion_present(self):
+        """_find_overwritten_file skips a file while its .crdownload companion exists."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+
+            existing = download_dir / "report.xlsx"
+            existing.write_bytes(b"old")
+            existing_stats = engine._snapshot_file_stats({existing})
+
+            import os
+            existing.write_bytes(b"new longer content here")
+            st = existing.stat()
+            os.utime(existing, (st.st_atime, st.st_mtime + 2))
+
+            # Companion present → skip.
+            companion = download_dir / "report.xlsx.crdownload"
+            companion.write_bytes(b"partial")
+            self.assertIsNone(engine._find_overwritten_file(existing_stats))
+
+            # Companion removed → detect.
+            companion.unlink()
+            self.assertEqual(engine._find_overwritten_file(existing_stats), existing)
+
+    def test_secondary_path_only_runs_after_primary_times_out(self):
+        """The secondary overwrite path is NOT invoked while new files can still appear."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+
+            # Pre-place a file that will be 'overwritten'.
+            pre_existing = download_dir / "old.xlsx"
+            pre_existing.write_bytes(b"old content")
+
+            # A driver that creates a *new* file (primary path should win).
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=9010&BillingPeriod=202607&Format=Detailed"
+            from ibis.downloader import DownloadQueue
+            queue = DownloadQueue.from_links([{"url": url}])
+            from ibis.scheduler import DownloadPlan
+            plan = DownloadPlan(queue)
+
+            driver = FakeDriver(download_dir, file_by_url={url: "new_invoice.xlsx"})
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+
+            with patch.object(engine, "_find_overwritten_file", wraps=engine._find_overwritten_file) as mock_secondary:
+                engine.run(plan)
+
+            # Primary path succeeded → secondary must never have been called.
+            mock_secondary.assert_not_called()
+            self.assertEqual(plan.scheduled_items[0].download_status, STATUS_COMPLETED)
+
+    def test_secondary_path_detects_overwritten_file_after_timeout(self):
+        """When no new file appears before timeout the engine uses the secondary path."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            import os
+
+            # Pre-place a file to be 'overwritten' after the driver.get() call.
+            target = download_dir / "overwritten.xlsx"
+            target.write_bytes(b"old content")
+
+            # Use a URL without metadata so the file keeps its original name.
+            url = "https://example.com/DownloadARExport.aspx"
+
+            class OverwriteDriver:
+                """Driver that rewrites an existing file instead of creating a new one."""
+                def __init__(self):
+                    self.opened_urls = []
+
+                def get(self, u):
+                    self.opened_urls.append(u)
+                    target.write_bytes(b"new much longer content here")
+                    st = target.stat()
+                    os.utime(target, (st.st_atime, st.st_mtime + 2))
+
+            from ibis.downloader import DownloadQueue
+            queue = DownloadQueue.from_links([{"url": url}])
+            from ibis.scheduler import DownloadPlan
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+
+            driver = OverwriteDriver()
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=0.1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            # No metadata → no rename; the overwritten file stays in-place.
+            self.assertEqual(item.filename, "overwritten.xlsx")
+            self.assertTrue(target.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

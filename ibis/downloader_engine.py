@@ -78,9 +78,10 @@ class DownloaderEngine:
 
         for attempt in range(MAX_RETRIES + 1):
             existing_files = self._snapshot_files()
+            existing_stats = self._snapshot_file_stats(existing_files)
             try:
                 self.driver.get(item.download_url)
-                downloaded_file = self._wait_for_download(existing_files)
+                downloaded_file = self._wait_for_download(existing_files, existing_stats)
 
                 if downloaded_file is None:
                     raise DownloadTimeoutError(
@@ -104,7 +105,7 @@ class DownloaderEngine:
 
         self._finalize_item(item, STATUS_FAILED)
 
-    def _wait_for_download(self, existing_files):
+    def _wait_for_download(self, existing_files, existing_stats=None):
         deadline = time.monotonic() + self.timeout
 
         while time.monotonic() < deadline:
@@ -113,6 +114,10 @@ class DownloaderEngine:
                 return downloaded_file
             time.sleep(self.poll_interval)
 
+        # Primary 'new file' detection timed out.  Only then try the secondary
+        # path: look for an existing file that was atomically overwritten.
+        if existing_stats:
+            return self._find_overwritten_file(existing_stats)
         return None
 
     def _find_new_completed_file(self, existing_files):
@@ -129,6 +134,47 @@ class DownloaderEngine:
             if (file_path.parent / (file_path.name + ".crdownload")) in current_files:
                 continue
             return file_path
+        return None
+
+    def _snapshot_file_stats(self, file_set):
+        """Return ``{path: (mtime, size)}`` for every path in *file_set* that
+        can be stat-ed.  Called once per download attempt so that the secondary
+        overwrite-detection path has a baseline to compare against."""
+        stats = {}
+        for path in file_set:
+            try:
+                st = path.stat()
+                stats[path] = (st.st_mtime, st.st_size)
+            except OSError:
+                pass
+        return stats
+
+    def _find_overwritten_file(self, existing_stats):
+        """Secondary detection: find a pre-existing file atomically overwritten
+        in-place.
+
+        A file qualifies only when **both** its mtime *and* its size differ
+        from the baseline captured in *existing_stats*.  Checking size as well
+        as mtime guards against false positives from OS clock granularity or
+        touch-only updates.
+
+        This method is intentionally called **only** after the primary
+        'new file' detection loop has already timed out; it must never replace
+        that primary path.
+        """
+        for path, (old_mtime, old_size) in existing_stats.items():
+            if path.suffix.lower() in _INCOMPLETE_SUFFIXES:
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if st.st_mtime == old_mtime or st.st_size == old_size:
+                continue
+            # Also skip while a .crdownload companion is present.
+            if (path.parent / (path.name + ".crdownload")).exists():
+                continue
+            return path
         return None
 
     def _build_target_filename(self, item) -> str | None:
