@@ -78,9 +78,10 @@ class DownloaderEngine:
 
         for attempt in range(MAX_RETRIES + 1):
             existing_files = self._snapshot_files()
+            snapshot_time = time.time()
             try:
                 self.driver.get(item.download_url)
-                downloaded_file = self._wait_for_download(existing_files)
+                downloaded_file = self._wait_for_download(existing_files, snapshot_time)
 
                 if downloaded_file is None:
                     raise DownloadTimeoutError(
@@ -104,21 +105,29 @@ class DownloaderEngine:
 
         self._finalize_item(item, STATUS_FAILED)
 
-    def _wait_for_download(self, existing_files):
+    def _wait_for_download(self, existing_files, snapshot_time):
         deadline = time.monotonic() + self.timeout
 
         while time.monotonic() < deadline:
-            downloaded_file = self._find_new_completed_file(existing_files)
+            downloaded_file = self._find_new_completed_file(existing_files, snapshot_time)
             if downloaded_file is not None:
                 return downloaded_file
             time.sleep(self.poll_interval)
 
         return None
 
-    def _find_new_completed_file(self, existing_files):
+    def _find_new_completed_file(self, existing_files, snapshot_time):
         current_files = self._snapshot_files()
+        candidates = []
+        for file_path in current_files:
+            if file_path not in existing_files:
+                candidates.append(file_path)
+                continue
+            if file_path.stat().st_mtime >= snapshot_time:
+                candidates.append(file_path)
+
         for file_path in sorted(
-            current_files - existing_files,
+            candidates,
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         ):

@@ -1,5 +1,7 @@
 import unittest
 import warnings
+import os
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -610,13 +612,46 @@ class DownloaderEngineTests(unittest.TestCase):
             crdownload = download_dir / "invoice.xlsx.crdownload"
             final_file.write_text("data", encoding="utf-8")
             crdownload.write_text("partial", encoding="utf-8")
+            snapshot_time = time.time() - 1
 
             # Companion still present — should not return the final file yet.
-            self.assertIsNone(engine._find_new_completed_file(existing_files))
+            self.assertIsNone(engine._find_new_completed_file(existing_files, snapshot_time))
 
             # Companion removed — download is complete.
             crdownload.unlink()
-            self.assertEqual(engine._find_new_completed_file(existing_files), final_file)
+            self.assertEqual(engine._find_new_completed_file(existing_files, snapshot_time), final_file)
+
+    def test_detects_existing_file_atomically_replaced_after_snapshot_time(self):
+        """An existing filename replaced in place must be detected by mtime."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=9101&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+
+            existing_file = download_dir / "DownloadARExport.aspx"
+            existing_file.write_text("old", encoding="utf-8")
+
+            class AtomicReplaceDriver:
+                def __init__(self, target_file: Path):
+                    self.target_file = target_file
+                    self.opened_urls = []
+
+                def get(self, current_url):
+                    self.opened_urls.append(current_url)
+                    self.target_file.write_text("new", encoding="utf-8")
+                    replaced_time = time.time() + 1
+                    os.utime(self.target_file, (replaced_time, replaced_time))
+
+            driver = AtomicReplaceDriver(existing_file)
+            engine = DownloaderEngine(driver, download_dir=download_dir, timeout=1, poll_interval=0.01)
+            engine.run(plan)
+
+            self.assertEqual(item.download_status, STATUS_COMPLETED)
+            self.assertEqual(item.filename, "202605_9101.xlsx")
+            self.assertTrue((download_dir / "202605_9101.xlsx").exists())
+            self.assertEqual(driver.opened_urls, [url])
 
     def test_crdownload_file_is_not_renamed(self):
         """A file with a .crdownload suffix must never be renamed."""
