@@ -197,6 +197,9 @@ class DownloaderEngine:
             reverse=True,
         ):
             candidates.append(str(file_path))
+            # Skip hidden files (e.g. Chrome temp files like .com.google.Chrome.XXXXX)
+            if file_path.name.startswith("."):
+                continue
             if file_path.suffix.lower() in _INCOMPLETE_SUFFIXES:
                 continue
             # Skip if the matching .crdownload companion still exists — the

@@ -618,6 +618,23 @@ class DownloaderEngineTests(unittest.TestCase):
             crdownload.unlink()
             self.assertEqual(engine._find_new_completed_file(existing_files), final_file)
 
+    def test_primary_detection_skips_hidden_chrome_temp_files(self):
+        """Primary detection must ignore hidden files such as .com.google.Chrome.XXXXX."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            existing_files = engine._snapshot_files()
+
+            # Simulate Chrome creating a hidden temp file first.
+            hidden = download_dir / ".com.google.Chrome.MUDRAA"
+            hidden.write_text("temp", encoding="utf-8")
+            # The final downloaded file also appears.
+            real_file = download_dir / "invoice-9999.xlsx"
+            real_file.write_text("data", encoding="utf-8")
+
+            result = engine._find_new_completed_file(existing_files)
+            self.assertEqual(result, real_file)
+
     def test_crdownload_file_is_not_renamed(self):
         """A file with a .crdownload suffix must never be renamed."""
         with TemporaryDirectory() as tmp:
