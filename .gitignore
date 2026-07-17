@@ -1,3 +1,18 @@
+# Python cache
 __pycache__/
 **/__pycache__/
 *.pyc
+
+# macOS
+.DS_Store
+
+# Downloaded invoices
+downloads/
+
+# Runtime logs
+logs/
+
+# Virtual environments
+.venv/
+venv/
+env/
