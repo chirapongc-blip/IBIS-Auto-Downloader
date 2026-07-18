@@ -8,12 +8,13 @@ from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_i
 from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
-from ibis.scheduler import DownloadPlan
+from ibis.scheduler import DownloadPlan, Scheduler
 from ibis.period_tracker import PeriodTracker
 from ibis.state_manager import StateManager
 
 
-def main():
+def _download_workflow():
+    """Execute the full Build 2.5 download workflow (one pass)."""
 
     driver = create_driver()
 
@@ -81,6 +82,11 @@ def main():
 
     finally:
         driver.quit()
+
+
+def main():
+    scheduler = Scheduler(_download_workflow)
+    scheduler.run_once()
 
 
 if __name__ == "__main__":
