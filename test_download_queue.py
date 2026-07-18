@@ -1,9 +1,16 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from ibis.downloader import DownloadQueue, STATUS_PENDING
+from ibis.downloader import (
+    DownloadQueue,
+    STATUS_PENDING,
+    build_download_queue,
+)
 from ibis.grid import GRID_ID
 from ibis.grid_walker import collect_grid_download_links
+from ibis.state_manager import StateManager
 
 
 class FakeElement:
@@ -165,6 +172,54 @@ class DownloadQueueTests(unittest.TestCase):
                 ("637647", "202605", "202605_22086"),
             ],
         )
+
+    def test_build_download_queue_keeps_only_latest_billing_period_before_queue_creation(self):
+        result = build_download_queue(
+            [
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=1001&BillingPeriod=202604&Format=Detailed",
+                },
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=1002&BillingPeriod=202605&Format=Detailed",
+                },
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=1003&BillingPeriod=202605&Format=Detailed",
+                },
+            ]
+        )
+
+        self.assertEqual(result.latest_billing_period, "202605")
+        self.assertEqual(result.found_count, 2)
+        self.assertEqual(result.already_completed_count, 0)
+        self.assertEqual([item.invoice_id for item in result.queue], ["1002", "1003"])
+
+    def test_build_download_queue_removes_completed_items_before_queue_creation(self):
+        with TemporaryDirectory() as tmp:
+            state_manager = StateManager(Path(tmp) / "completed_invoices.json")
+            state_manager.mark_completed(
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=1002&BillingPeriod=202605&Format=Detailed",
+                }
+            )
+
+            result = build_download_queue(
+                [
+                    {
+                        "url": "https://example.com/DownloadARExport.aspx?InvoiceID=1001&BillingPeriod=202604&Format=Detailed",
+                    },
+                    {
+                        "url": "https://example.com/DownloadARExport.aspx?InvoiceID=1002&BillingPeriod=202605&Format=Detailed",
+                    },
+                    {
+                        "url": "https://example.com/DownloadARExport.aspx?InvoiceID=1003&BillingPeriod=202605&Format=Detailed",
+                    },
+                ],
+                state_manager=state_manager,
+            )
+
+        self.assertEqual(result.found_count, 2)
+        self.assertEqual(result.already_completed_count, 1)
+        self.assertEqual([item.invoice_id for item in result.queue], ["1003"])
 
 
 if __name__ == "__main__":

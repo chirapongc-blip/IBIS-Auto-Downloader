@@ -2,7 +2,7 @@ import unittest
 import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from ibis.downloader import DownloadQueue, STATUS_PENDING
 from ibis.downloader_engine import (
@@ -125,6 +125,30 @@ class DownloaderEngineTests(unittest.TestCase):
 
             statuses = [call.args[1] for call in mocked_set_status.call_args_list if call.args[0] is item]
             self.assertEqual(statuses, [STATUS_PENDING, STATUS_DOWNLOADING, STATUS_COMPLETED])
+
+    def test_completed_items_are_recorded_in_state_manager(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            link = {
+                "url": "https://example.com/DownloadARExport.aspx?InvoiceID=2002&BillingPeriod=202605&Format=Detailed",
+            }
+            queue = DownloadQueue.from_links([link])
+            plan = DownloadPlan(queue)
+            item = plan.scheduled_items[0]
+            state_manager = MagicMock()
+
+            driver = FakeDriver(download_dir, file_by_url={link["url"]: "invoice-2002.pdf"})
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+                state_manager=state_manager,
+            )
+
+            engine.run(plan)
+
+            state_manager.mark_completed.assert_called_once_with(item)
 
     def test_marks_item_failed_when_no_file_is_downloaded(self):
         with TemporaryDirectory() as tmp:

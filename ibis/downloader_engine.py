@@ -58,11 +58,12 @@ def is_retryable(exc):
 
 
 class DownloaderEngine:
-    def __init__(self, driver, *, download_dir=None, timeout=60, poll_interval=0.2):
+    def __init__(self, driver, *, download_dir=None, timeout=60, poll_interval=0.2, state_manager=None):
         self.driver = driver
         self.download_dir = Path(download_dir) if download_dir is not None else get_download_dir()
         self.timeout = timeout
         self.poll_interval = poll_interval
+        self.state_manager = state_manager
         self.summary = DownloadSummary()
 
     def run(self, plan):
@@ -93,6 +94,8 @@ class DownloaderEngine:
 
                 renamed = self._rename_downloaded_file(downloaded_file, item)
                 item.filename = renamed.name
+                if self.state_manager is not None:
+                    self.state_manager.mark_completed(item)
                 self._finalize_item(item, STATUS_COMPLETED)
                 return
 
