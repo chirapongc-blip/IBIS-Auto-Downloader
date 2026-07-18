@@ -41,6 +41,7 @@ class TestMainFlowIntegration(unittest.TestCase):
             queue=MagicMock(),
             found_count=1,
             already_completed_count=1,
+            latest_billing_period="202605",
         )
 
         with patch("main.create_driver", return_value=fake_driver), \
@@ -54,10 +55,13 @@ class TestMainFlowIntegration(unittest.TestCase):
              patch("main.collect_grid_download_links", return_value=fake_links) as mock_collect, \
              patch("main.StateManager") as MockStateManager, \
              patch("main.build_download_queue", return_value=queue_result) as mock_build_queue, \
+             patch("main.PeriodTracker") as MockPeriodTracker, \
              patch("main.DownloadPlan") as MockPlan, \
              patch("main.DownloaderEngine") as MockEngine:
 
             mock_state_manager_instance = MockStateManager.return_value
+            mock_period_tracker_instance = MockPeriodTracker.return_value
+            mock_period_tracker_instance.load_last_period.return_value = None
             mock_plan_instance = MockPlan.return_value
             mock_plan_instance.scheduled_count = 1
 
@@ -71,6 +75,8 @@ class TestMainFlowIntegration(unittest.TestCase):
                 "mock_collect": mock_collect,
                 "MockStateManager": MockStateManager,
                 "mock_state_manager_instance": mock_state_manager_instance,
+                "MockPeriodTracker": MockPeriodTracker,
+                "mock_period_tracker_instance": mock_period_tracker_instance,
                 "mock_build_queue": mock_build_queue,
                 "queue_result": queue_result,
                 "MockPlan": MockPlan,
