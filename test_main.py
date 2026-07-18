@@ -18,7 +18,16 @@ class TestMainFlowIntegration(unittest.TestCase):
     placeholder stop message.
     """
 
-    def _run_main(self, *, scheduled_count=1, completed=1, failed=0, latest_period="202605"):
+    def _run_main(
+        self,
+        *,
+        scheduled_count=1,
+        completed=1,
+        failed=0,
+        latest_period="202605",
+        queue_size=0,
+        period_file_exists=True,
+    ):
         """
         Patch all browser/network dependencies and execute main().
         Returns the mock objects so tests can inspect the call history.
@@ -37,10 +46,13 @@ class TestMainFlowIntegration(unittest.TestCase):
                 "billing_period": "202605",
             }
         ]
+        queue = MagicMock()
+        queue.__len__.return_value = queue_size
         queue_result = SimpleNamespace(
-            queue=MagicMock(),
+            queue=queue,
             found_count=1,
             already_completed_count=1,
+            latest_billing_period=latest_period,
         )
 
         with patch("main.create_driver", return_value=fake_driver), \
@@ -66,6 +78,7 @@ class TestMainFlowIntegration(unittest.TestCase):
             mock_engine_instance = MockEngine.return_value
             mock_engine_instance.summary = SimpleNamespace(completed=completed, failed=failed)
             mock_period_tracker_instance = MockPeriodTracker.return_value
+            mock_period_tracker_instance.last_period_file_exists.return_value = period_file_exists
 
             import main
             main.main()
@@ -134,15 +147,58 @@ class TestMainFlowIntegration(unittest.TestCase):
         self.assertIn("Download Queue: 0", output)
 
     def test_last_period_saved_when_all_downloads_succeed(self):
-        result = self._run_main(scheduled_count=2, completed=2, failed=0, latest_period="202606")
+        result = self._run_main(
+            scheduled_count=2,
+            completed=2,
+            failed=0,
+            latest_period="202606",
+            queue_size=2,
+            period_file_exists=True,
+        )
         result["mock_period_tracker_instance"].save_last_period.assert_called_once_with("202606")
 
     def test_last_period_not_saved_when_any_download_fails(self):
-        result = self._run_main(scheduled_count=2, completed=1, failed=1, latest_period="202606")
+        result = self._run_main(
+            scheduled_count=2,
+            completed=1,
+            failed=1,
+            latest_period="202606",
+            queue_size=2,
+            period_file_exists=True,
+        )
         result["mock_period_tracker_instance"].save_last_period.assert_not_called()
 
     def test_last_period_not_saved_when_completed_count_mismatches_plan(self):
-        result = self._run_main(scheduled_count=2, completed=1, failed=0, latest_period="202606")
+        result = self._run_main(
+            scheduled_count=2,
+            completed=1,
+            failed=0,
+            latest_period="202606",
+            queue_size=2,
+            period_file_exists=True,
+        )
+        result["mock_period_tracker_instance"].save_last_period.assert_not_called()
+
+    def test_last_period_initialized_once_when_queue_empty_and_file_missing(self):
+        result = self._run_main(
+            scheduled_count=0,
+            completed=0,
+            failed=0,
+            latest_period="202606",
+            queue_size=0,
+            period_file_exists=False,
+        )
+        result["mock_period_tracker_instance"].save_last_period.assert_called_once_with("202606")
+
+    def test_last_period_not_overwritten_when_queue_empty_and_file_exists(self):
+        result = self._run_main(
+            scheduled_count=0,
+            completed=0,
+            failed=0,
+            latest_period="202606",
+            queue_size=0,
+            period_file_exists=True,
+        )
         result["mock_period_tracker_instance"].save_last_period.assert_not_called()
 
 

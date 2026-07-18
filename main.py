@@ -70,14 +70,14 @@ def main():
 
         engine = DownloaderEngine(driver, state_manager=state_manager)
         period_tracker = PeriodTracker()
-        current_period = plan.latest_billing_period
+        current_period = queue_result.latest_billing_period or plan.latest_billing_period
         engine.run(plan)
-        if (
-            engine.summary.failed == 0
-            and engine.summary.completed == plan.scheduled_count
-            and current_period is not None
-        ):
-            period_tracker.save_last_period(current_period)
+        if engine.summary.failed == 0 and current_period is not None:
+            if len(queue) == 0:
+                if not period_tracker.last_period_file_exists():
+                    period_tracker.save_last_period(current_period)
+            elif engine.summary.completed == plan.scheduled_count:
+                period_tracker.save_last_period(current_period)
 
     finally:
         driver.quit()
