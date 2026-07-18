@@ -36,6 +36,7 @@ class TestMainFlowIntegration(unittest.TestCase):
                 "billing_period": "202605",
             }
         ]
+        filtered_links = [fake_links[0]]
 
         with patch("main.create_driver", return_value=fake_driver), \
              patch("main.wait_until_logged_in"), \
@@ -46,11 +47,16 @@ class TestMainFlowIntegration(unittest.TestCase):
              patch("main.get_grid_text", return_value=""), \
              patch("main.get_devexpress_pager_info", return_value={}), \
              patch("main.collect_grid_download_links", return_value=fake_links) as mock_collect, \
+             patch("main.StateManager") as MockStateManager, \
              patch("main.DownloadPlan") as MockPlan, \
              patch("main.DownloaderEngine") as MockEngine:
 
+            mock_state_manager = MockStateManager.return_value
+            mock_state_manager.filter_pending_links.return_value = filtered_links
+
             mock_plan_instance = MockPlan.return_value
             mock_plan_instance.scheduled_count = 1
+            mock_plan_instance.scheduled_items = ["scheduled-item"]
 
             mock_engine_instance = MockEngine.return_value
 
@@ -60,6 +66,9 @@ class TestMainFlowIntegration(unittest.TestCase):
             return {
                 "driver": fake_driver,
                 "mock_collect": mock_collect,
+                "MockStateManager": MockStateManager,
+                "mock_state_manager": mock_state_manager,
+                "filtered_links": filtered_links,
                 "MockPlan": MockPlan,
                 "mock_plan_instance": mock_plan_instance,
                 "MockEngine": MockEngine,
@@ -85,6 +94,29 @@ class TestMainFlowIntegration(unittest.TestCase):
         """DownloaderEngine must be instantiated with the Selenium driver."""
         result = self._run_main()
         result["MockEngine"].assert_called_once_with(result["driver"])
+
+    def test_state_manager_filters_links_before_queue_creation(self):
+        result = self._run_main()
+        result["mock_state_manager"].load.assert_called_once_with()
+        result["mock_state_manager"].filter_pending_links.assert_called_once_with(
+            result["mock_collect"].return_value
+        )
+
+        args, _ = result["MockPlan"].call_args
+        queue = args[0]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual([item.invoice_id for item in queue], ["1001"])
+
+    def test_state_manager_saves_completed_downloads_after_engine_run(self):
+        result = self._run_main()
+
+        result["mock_engine_instance"].run.assert_called_once_with(
+            result["mock_plan_instance"]
+        )
+        result["mock_state_manager"].mark_completed_items.assert_called_once_with(
+            result["mock_plan_instance"].scheduled_items
+        )
+        result["mock_state_manager"].save.assert_called_once_with()
 
     def test_driver_quit_called_on_success(self):
         """driver.quit() must always be called (finally block)."""

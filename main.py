@@ -9,6 +9,7 @@ from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
 from ibis.scheduler import DownloadPlan
+from ibis.state_manager import StateManager
 
 
 def main():
@@ -55,8 +56,12 @@ def main():
         print(get_grid_text(driver)[:1000])
         print("==================================\n")
 
+        state_manager = StateManager()
+        state_manager.load()
+
         all_links = collect_grid_download_links(driver, BASE_URL)
-        queue = DownloadQueue.from_links(all_links)
+        pending_links = state_manager.filter_pending_links(all_links)
+        queue = DownloadQueue.from_links(pending_links)
 
         print(f"所有分页共发现 {len(all_links)} 个下载链接。")
         print(f"下载队列已创建，共 {len(queue)} 个项目。")
@@ -66,6 +71,8 @@ def main():
 
         engine = DownloaderEngine(driver)
         engine.run(plan)
+        state_manager.mark_completed_items(plan.scheduled_items)
+        state_manager.save()
 
     finally:
         driver.quit()
