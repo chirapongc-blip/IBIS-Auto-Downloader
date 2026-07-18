@@ -8,6 +8,7 @@ from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_i
 from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
+from ibis.period_tracker import PeriodTracker
 from ibis.scheduler import DownloadPlan
 from ibis.state_manager import StateManager
 
@@ -67,8 +68,19 @@ def main():
         plan = DownloadPlan(queue, latest_only=False)
         print(f"下载计划已建立，共 {plan.scheduled_count} 个项目。")
 
+        period_tracker = PeriodTracker()
+        stored_period = period_tracker.load_last_period()
+        current_period = queue_result.latest_billing_period
+        if current_period and current_period != stored_period:
+            print(f"新 Billing Period 检测到：{current_period}（上次：{stored_period}）")
+        else:
+            print(f"Billing Period 未变更：{current_period}")
+
         engine = DownloaderEngine(driver, state_manager=state_manager)
         engine.run(plan)
+
+        if current_period and current_period != stored_period:
+            period_tracker.save_last_period(current_period)
 
     finally:
         driver.quit()
