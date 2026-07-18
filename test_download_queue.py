@@ -222,5 +222,127 @@ class DownloadQueueTests(unittest.TestCase):
         self.assertEqual([item.invoice_id for item in result.queue], ["1003"])
 
 
+class TestBuild24FilteringBeforeQueue(unittest.TestCase):
+    """
+    Build 2.4: StateManager must filter completed invoices BEFORE DownloadQueue
+    is constructed.  DownloaderEngine must never receive already-completed items.
+
+    Expected production output on a second run (all invoices already completed):
+
+        Found invoices: 35
+        Already completed: 35
+        Download Queue: 0
+
+    NOT:
+
+        Download Queue: 35
+        Skipped: 35
+    """
+
+    def test_second_run_all_completed_returns_empty_queue(self):
+        """Exact production scenario: 35 invoices, all already completed.
+
+        After a successful first run every invoice is recorded in state.  The
+        second run must produce an empty queue — NOT a queue of 35 items that
+        the engine then skips.
+        """
+        with TemporaryDirectory() as tmp:
+            state_manager = StateManager(Path(tmp) / "completed_invoices.json")
+            links = [
+                {
+                    "url": (
+                        f"https://example.com/DownloadARExport.aspx"
+                        f"?InvoiceID={i}&BillingPeriod=202605&Format=Detailed"
+                    )
+                }
+                for i in range(1, 36)  # 35 invoices
+            ]
+            for link in links:
+                state_manager.mark_completed(link)
+
+            result = build_download_queue(links, state_manager=state_manager)
+
+        # Build 2.4 contract: found reflects the billing-period count, queue is 0
+        self.assertEqual(result.found_count, 35)
+        self.assertEqual(result.already_completed_count, 35)
+        self.assertEqual(len(result.queue), 0)
+
+    def test_found_count_is_latest_period_count_independent_of_state(self):
+        """found_count reflects the invoices discovered in the latest billing
+        period; already_completed_count and queue size are derived from state."""
+        with TemporaryDirectory() as tmp:
+            state_manager = StateManager(Path(tmp) / "completed_invoices.json")
+            links = [
+                {
+                    "url": (
+                        f"https://example.com/DownloadARExport.aspx"
+                        f"?InvoiceID={i}&BillingPeriod=202605&Format=Detailed"
+                    )
+                }
+                for i in range(1, 6)  # 5 invoices
+            ]
+            # Mark 3 of 5 completed
+            for link in links[:3]:
+                state_manager.mark_completed(link)
+
+            result = build_download_queue(links, state_manager=state_manager)
+
+        self.assertEqual(result.found_count, 5)
+        self.assertEqual(result.already_completed_count, 3)
+        self.assertEqual(len(result.queue), 2)
+        remaining_ids = [item.invoice_id for item in result.queue]
+        self.assertEqual(remaining_ids, ["4", "5"])
+
+    def test_queue_contains_only_pending_invoices_not_all_found(self):
+        """The DownloadQueue must be constructed exclusively from pending links.
+
+        Filtering must occur inside build_download_queue before the queue
+        object is created — not inside DownloaderEngine.
+        """
+        with TemporaryDirectory() as tmp:
+            state_manager = StateManager(Path(tmp) / "completed_invoices.json")
+            completed_url = (
+                "https://example.com/DownloadARExport.aspx"
+                "?InvoiceID=10&BillingPeriod=202605&Format=Detailed"
+            )
+            pending_url = (
+                "https://example.com/DownloadARExport.aspx"
+                "?InvoiceID=11&BillingPeriod=202605&Format=Detailed"
+            )
+            state_manager.mark_completed({"url": completed_url})
+
+            result = build_download_queue(
+                [{"url": completed_url}, {"url": pending_url}],
+                state_manager=state_manager,
+            )
+
+        queue_urls = [item.download_url for item in result.queue]
+        self.assertNotIn(completed_url, queue_urls, "Completed invoice must not enter the queue")
+        self.assertIn(pending_url, queue_urls, "Pending invoice must be in the queue")
+
+    def test_no_state_manager_includes_all_latest_period_invoices(self):
+        """Without a state_manager every invoice in the latest period is queued."""
+        result = build_download_queue(
+            [
+                {
+                    "url": (
+                        "https://example.com/DownloadARExport.aspx"
+                        "?InvoiceID=20&BillingPeriod=202605&Format=Detailed"
+                    )
+                },
+                {
+                    "url": (
+                        "https://example.com/DownloadARExport.aspx"
+                        "?InvoiceID=21&BillingPeriod=202605&Format=Detailed"
+                    )
+                },
+            ]
+        )
+
+        self.assertEqual(result.found_count, 2)
+        self.assertEqual(result.already_completed_count, 0)
+        self.assertEqual(len(result.queue), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
