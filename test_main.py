@@ -83,7 +83,6 @@ class TestMainFlowIntegration(unittest.TestCase):
                 "mock_engine_instance": mock_engine_instance,
                 "MockPeriodTracker": MockPeriodTracker,
                 "mock_period_tracker_instance": mock_period_tracker_instance,
-                "mock_plan_instance": mock_plan_instance,
             }
 
     def test_queue_is_built_from_scanned_links_and_state_manager(self):
