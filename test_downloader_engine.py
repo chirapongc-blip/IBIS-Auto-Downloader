@@ -690,5 +690,72 @@ class DownloaderEngineTests(unittest.TestCase):
             self.assertIn("202605_9001.xlsx", str(caught[0].message))
 
 
+class TestBuild24EngineNeverReceivesCompletedItems(unittest.TestCase):
+    """
+    Build 2.4 contract: DownloaderEngine must never perform skip-filtering on
+    already-completed invoices.  All filtering happens in build_download_queue
+    (via StateManager) before the DownloadQueue is constructed.
+
+    When the queue is empty because all invoices were pre-filtered, the engine
+    must process zero items and record zero skips.
+    """
+
+    def test_engine_processes_zero_items_when_queue_is_prefiltered_empty(self):
+        """If StateManager filtered every invoice before queue construction,
+        the engine receives an empty plan and opens no URLs."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            queue = DownloadQueue()  # empty — all items removed before construction
+            plan = DownloadPlan(queue)
+
+            driver = FakeDriver(download_dir)
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+            )
+            engine.run(plan)
+
+        self.assertEqual(len(driver.opened_urls), 0, "Engine must open no URLs for an empty queue")
+        self.assertEqual(engine.summary.total_files, 0)
+        self.assertEqual(engine.summary.completed, 0)
+        self.assertEqual(engine.summary.skipped, 0, "Engine must not skip items — filtering happens before the queue")
+        self.assertEqual(engine.summary.failed, 0)
+
+    def test_engine_summary_skipped_is_zero_after_normal_run(self):
+        """DownloaderEngine has no skip logic; skipped is always 0 after a normal run."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            links = [
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=8001&BillingPeriod=202605&Format=Detailed",
+                },
+                {
+                    "url": "https://example.com/DownloadARExport.aspx?InvoiceID=8002&BillingPeriod=202605&Format=Detailed",
+                },
+            ]
+            queue = DownloadQueue.from_links(links)
+            plan = DownloadPlan(queue)
+
+            driver = FakeDriver(
+                download_dir,
+                file_by_url={
+                    links[0]["url"]: "invoice-8001.pdf",
+                    links[1]["url"]: "invoice-8002.pdf",
+                },
+            )
+            engine = DownloaderEngine(
+                driver,
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+            )
+            engine.run(plan)
+
+        self.assertEqual(engine.summary.skipped, 0, "Engine must never produce skipped items")
+        self.assertEqual(engine.summary.completed, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

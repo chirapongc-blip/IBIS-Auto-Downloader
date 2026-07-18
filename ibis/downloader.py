@@ -112,6 +112,18 @@ def filter_links_to_latest_billing_period(links):
 
 
 def build_download_queue(links, *, state_manager=None):
+    """Build a download queue from *links* following the Build 2.4 pipeline:
+
+    1. ``filter_links_to_latest_billing_period`` — determine the latest period
+       and restrict *links* to that period only.
+    2. ``StateManager.filter_pending_links`` — remove already-completed invoices
+       **before** queue construction so the engine never receives them.
+    3. ``DownloadQueue.from_links(pending_links)`` — queue built from the
+       remaining pending links only.
+
+    ``found_count`` always reflects the number of invoices discovered in the
+    latest billing period, independent of how many are pending or completed.
+    """
     latest_links, latest_billing_period = filter_links_to_latest_billing_period(links)
     pending_links = latest_links
     already_completed_count = 0

@@ -13,7 +13,7 @@ from ibis.state_manager import StateManager
 
 
 def main():
-    print("=== IBIS Auto Downloader V2.0 Beta ===")
+    print("=== IBIS Auto Downloader V2.4 ===")
 
     driver = create_driver()
 
