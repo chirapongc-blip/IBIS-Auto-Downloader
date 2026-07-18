@@ -21,6 +21,7 @@ from ibis.downloader_engine import (
     TemporaryBrowserError,
     DownloadTimeoutError,
 )
+from ibis.state_manager import StateManager
 from ibis.scheduler import DownloadPlan
 
 
@@ -472,6 +473,59 @@ class DownloaderEngineTests(unittest.TestCase):
         self.assertEqual(engine.summary.completed, 0)
         self.assertEqual(engine.summary.failed, 0)
         mocked_print.assert_called_once_with("[1/1] Skipped invoice-5004.pdf")
+
+    def test_skip_existing_uses_existing_target_file_without_driver_get(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            existing = download_dir / "202605_5007.xlsx"
+            existing.write_text("already downloaded", encoding="utf-8")
+
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=5007&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+
+            state_path = download_dir / "state" / "downloads.json"
+            state_manager = StateManager(state_path)
+            state_manager.mark_completed(plan.scheduled_items[0], existing.name)
+            engine = DownloaderEngine(
+                FakeDriver(download_dir),
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+                state_manager=state_manager,
+            )
+
+            engine.run(plan)
+
+            item = plan.scheduled_items[0]
+            self.assertEqual(item.download_status, STATUS_SKIPPED)
+            self.assertEqual(item.filename, "202605_5007.xlsx")
+            self.assertEqual(engine.summary.skipped, 1)
+            self.assertEqual(engine.summary.completed, 0)
+            self.assertEqual(engine.driver.opened_urls, [])
+
+    def test_successful_download_is_persisted_to_state_file(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=5008&BillingPeriod=202605&Format=Detailed"
+            queue = DownloadQueue.from_links([{"url": url}])
+            plan = DownloadPlan(queue)
+
+            state_path = download_dir / "state" / "downloads.json"
+            engine = DownloaderEngine(
+                FakeDriver(download_dir, file_by_url={url: "invoice-5008.pdf"}),
+                download_dir=download_dir,
+                timeout=1,
+                poll_interval=0.01,
+                state_manager=StateManager(state_path),
+            )
+
+            engine.run(plan)
+
+            reloaded = StateManager(state_path)
+            item = plan.scheduled_items[0]
+            self.assertTrue(reloaded.has_completed(item))
+            self.assertEqual(reloaded.get_completed_filename(item), "202605_5008.xlsx")
 
     def test_progress_output_and_final_summary_are_terminal_state_oriented(self):
         with TemporaryDirectory() as tmp:
