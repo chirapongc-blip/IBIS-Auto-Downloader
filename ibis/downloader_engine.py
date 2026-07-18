@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ibis.downloader import get_download_dir, STATUS_PENDING
+from ibis.state_manager import StateManager
 
 
 STATUS_DOWNLOADING = "downloading"
@@ -63,11 +64,13 @@ def is_retryable(exc):
 
 
 class DownloaderEngine:
-    def __init__(self, driver, *, download_dir=None, timeout=60, poll_interval=0.2):
+    def __init__(self, driver, *, download_dir=None, timeout=60, poll_interval=0.2, state_manager=None):
         self.driver = driver
         self.download_dir = Path(download_dir) if download_dir is not None else get_download_dir()
         self.timeout = timeout
         self.poll_interval = poll_interval
+        default_state_path = self.download_dir.parent / "state" / "downloads.json"
+        self.state_manager = state_manager if state_manager is not None else StateManager(default_state_path)
         self.summary = DownloadSummary()
 
     def _debug(self, message, **fields):
@@ -95,8 +98,23 @@ class DownloaderEngine:
         self.summary = DownloadSummary(total_files=len(plan.scheduled_items))
         started_at = time.monotonic()
         for item in plan.scheduled_items:
+            existing_file = self._find_existing_download(item)
+            if existing_file is not None:
+                item.filename = existing_file.name
+                self.state_manager.mark_completed(item, existing_file.name)
+                self._finalize_item(item, STATUS_SKIPPED)
+                continue
             self._download_item(item)
         self._print_summary(time.monotonic() - started_at)
+
+    def _find_existing_download(self, item):
+        state_filename = self.state_manager.get_completed_filename(item)
+        if not state_filename:
+            return None
+        state_path = self.download_dir / state_filename
+        if state_path.exists() and state_path.is_file():
+            return state_path
+        return None
 
     def _download_item(self, item):
         self._set_status(item, STATUS_PENDING)
@@ -164,6 +182,7 @@ class DownloaderEngine:
                     selected_file=str(downloaded_file),
                     final_file=str(renamed),
                 )
+                self.state_manager.mark_completed(item, renamed.name)
                 self._finalize_item(item, STATUS_COMPLETED)
                 return
 
