@@ -16,3 +16,6 @@ logs/
 .venv/
 venv/
 env/
+
+state/*.json
+!state/.gitkeep
