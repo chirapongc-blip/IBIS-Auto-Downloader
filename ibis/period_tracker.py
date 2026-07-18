@@ -24,6 +24,9 @@ class PeriodTracker:
         last_period = state.get("last_period")
         return last_period if isinstance(last_period, str) else None
 
+    def last_period_file_exists(self):
+        return self.state_file.exists()
+
     def save_last_period(self, period):
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         with self.state_file.open("w", encoding="utf-8") as fh:
