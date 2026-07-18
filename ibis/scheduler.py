@@ -1,4 +1,5 @@
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 from ibis.downloader import DownloadQueue
 
@@ -102,3 +103,66 @@ class DownloadPlan:
 
         self._scheduled_items = scheduled
         self._duplicates_removed = duplicates
+
+
+class Scheduler:
+    """Lightweight scheduler that wraps the Build 2.5 download workflow.
+
+    Parameters
+    ----------
+    workflow : callable
+        A zero-argument callable that executes the full Build 2.5 download
+        workflow (e.g. the ``main`` function or any equivalent callable).
+        The scheduler never modifies ``DownloaderEngine``, ``StateManager``,
+        or ``PeriodTracker`` — those are entirely owned by *workflow*.
+    interval : timedelta | None
+        How long to wait between runs.  ``None`` (the default) means the
+        scheduler is one-shot: ``should_run()`` returns ``True`` only until
+        the first call to ``run_once()``.
+    run_immediately : bool
+        When *True* (the default) ``should_run()`` returns ``True`` as soon
+        as the scheduler is created, so the first run happens without delay.
+    """
+
+    def __init__(self, workflow, *, interval=None, run_immediately=True):
+        self._workflow = workflow
+        self._interval = interval
+        self._run_count = 0
+        now = datetime.now(tz=timezone.utc)
+        # The time the scheduler considers itself "ready" to run next.
+        self._next_run: datetime = now if run_immediately else self._advance(now)
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def should_run(self) -> bool:
+        """Return *True* if it is time (or past time) to execute the workflow."""
+        return datetime.now(tz=timezone.utc) >= self._next_run
+
+    def next_run(self) -> datetime:
+        """Return the UTC datetime at which the next run is (or was) scheduled."""
+        return self._next_run
+
+    def run_once(self):
+        """Execute the workflow exactly once and update the schedule.
+
+        The workflow callable is invoked unconditionally — callers are
+        responsible for checking ``should_run()`` first if they want
+        time-gated behaviour.
+        """
+        self._workflow()
+        self._run_count += 1
+        self._next_run = self._advance(datetime.now(tz=timezone.utc))
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _advance(self, from_time: datetime) -> datetime:
+        """Return the next scheduled time relative to *from_time*."""
+        if self._interval is not None:
+            return from_time + self._interval
+        # One-shot mode: schedule infinitely far in the future so
+        # should_run() always returns False after the first run.
+        return datetime.max.replace(tzinfo=timezone.utc)
