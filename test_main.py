@@ -18,7 +18,7 @@ class TestMainFlowIntegration(unittest.TestCase):
     placeholder stop message.
     """
 
-    def _run_main(self):
+    def _run_main(self, *, scheduled_count=1, completed=1, failed=0, latest_period="202605"):
         """
         Patch all browser/network dependencies and execute main().
         Returns the mock objects so tests can inspect the call history.
@@ -55,13 +55,17 @@ class TestMainFlowIntegration(unittest.TestCase):
              patch("main.StateManager") as MockStateManager, \
              patch("main.build_download_queue", return_value=queue_result) as mock_build_queue, \
              patch("main.DownloadPlan") as MockPlan, \
-             patch("main.DownloaderEngine") as MockEngine:
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker") as MockPeriodTracker:
 
             mock_state_manager_instance = MockStateManager.return_value
             mock_plan_instance = MockPlan.return_value
-            mock_plan_instance.scheduled_count = 1
+            mock_plan_instance.scheduled_count = scheduled_count
+            mock_plan_instance.latest_billing_period = latest_period
 
             mock_engine_instance = MockEngine.return_value
+            mock_engine_instance.summary = SimpleNamespace(completed=completed, failed=failed)
+            mock_period_tracker_instance = MockPeriodTracker.return_value
 
             import main
             main.main()
@@ -77,6 +81,8 @@ class TestMainFlowIntegration(unittest.TestCase):
                 "mock_plan_instance": mock_plan_instance,
                 "MockEngine": MockEngine,
                 "mock_engine_instance": mock_engine_instance,
+                "MockPeriodTracker": MockPeriodTracker,
+                "mock_period_tracker_instance": mock_period_tracker_instance,
             }
 
     def test_queue_is_built_from_scanned_links_and_state_manager(self):
@@ -126,6 +132,18 @@ class TestMainFlowIntegration(unittest.TestCase):
         self.assertIn("Found invoices: 1", output)
         self.assertIn("Already completed: 1", output)
         self.assertIn("Download Queue: 0", output)
+
+    def test_last_period_saved_when_all_downloads_succeed(self):
+        result = self._run_main(scheduled_count=2, completed=2, failed=0, latest_period="202606")
+        result["mock_period_tracker_instance"].save_last_period.assert_called_once_with("202606")
+
+    def test_last_period_not_saved_when_any_download_fails(self):
+        result = self._run_main(scheduled_count=2, completed=1, failed=1, latest_period="202606")
+        result["mock_period_tracker_instance"].save_last_period.assert_not_called()
+
+    def test_last_period_not_saved_when_completed_count_mismatches_plan(self):
+        result = self._run_main(scheduled_count=2, completed=1, failed=0, latest_period="202606")
+        result["mock_period_tracker_instance"].save_last_period.assert_not_called()
 
 
 if __name__ == "__main__":
