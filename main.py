@@ -9,6 +9,7 @@ from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
 from ibis.scheduler import DownloadPlan
+from ibis.period_tracker import PeriodTracker
 from ibis.state_manager import StateManager
 
 
@@ -68,7 +69,15 @@ def main():
         print(f"下载计划已建立，共 {plan.scheduled_count} 个项目。")
 
         engine = DownloaderEngine(driver, state_manager=state_manager)
+        period_tracker = PeriodTracker()
+        current_period = plan.latest_billing_period
         engine.run(plan)
+        if (
+            engine.summary.failed == 0
+            and engine.summary.completed == plan.scheduled_count
+            and current_period is not None
+        ):
+            period_tracker.save_last_period(current_period)
 
     finally:
         driver.quit()
