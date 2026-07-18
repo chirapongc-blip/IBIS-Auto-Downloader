@@ -1,4 +1,4 @@
-from config import BASE_URL
+from config import BASE_URL, VERSION
 from selenium.webdriver.common.by import By
 
 from ibis.browser import create_driver
@@ -13,7 +13,6 @@ from ibis.state_manager import StateManager
 
 
 def main():
-    print("=== IBIS Auto Downloader V2.0 Beta ===")
 
     driver = create_driver()
 
