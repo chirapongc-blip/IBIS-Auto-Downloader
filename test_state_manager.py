@@ -33,6 +33,16 @@ class StateManagerTests(unittest.TestCase):
         reloaded = StateManager(state_file=self.state_file)
         self.assertEqual(reloaded.load(), {"1001", "1002"})
 
+    def test_load_treats_invalid_json_as_empty_state(self):
+        self.state_file.write_text("{not-json", encoding="utf-8")
+
+        self.assertEqual(self.state_manager.load(), set())
+
+    def test_load_accepts_legacy_list_payload(self):
+        self.state_file.write_text('["1001", "1002"]', encoding="utf-8")
+
+        self.assertEqual(self.state_manager.load(), {"1001", "1002"})
+
     def test_filter_pending_links_skips_downloaded_invoice_ids(self):
         self.state_manager.mark_downloaded("1002")
 

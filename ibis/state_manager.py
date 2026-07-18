@@ -19,8 +19,18 @@ class StateManager:
             self._downloaded_invoice_ids = set()
             return self.downloaded_invoice_ids
 
-        data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        invoice_ids = data.get("downloaded_invoice_ids", [])
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self._downloaded_invoice_ids = set()
+            return self.downloaded_invoice_ids
+
+        if isinstance(data, dict):
+            invoice_ids = data.get("downloaded_invoice_ids", [])
+        elif isinstance(data, list):
+            invoice_ids = data
+        else:
+            invoice_ids = []
         self._downloaded_invoice_ids = {
             str(invoice_id).strip()
             for invoice_id in invoice_ids
