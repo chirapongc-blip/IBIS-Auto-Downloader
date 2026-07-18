@@ -2,12 +2,13 @@
 Unit tests for the main.py pipeline integration (Build 2.2 – Task 3).
 
 These tests verify that the main() function wires the components in the
-correct order: DownloadQueue → DownloadPlan → DownloaderEngine.run(plan).
+correct order: scan → state filter → DownloadQueue → DownloadPlan → DownloaderEngine.run(plan).
 They do not exercise the browser or network; all external dependencies are
 patched.
 """
+from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 
 class TestMainFlowIntegration(unittest.TestCase):
@@ -36,6 +37,11 @@ class TestMainFlowIntegration(unittest.TestCase):
                 "billing_period": "202605",
             }
         ]
+        queue_result = SimpleNamespace(
+            queue=MagicMock(),
+            found_count=1,
+            already_completed_count=1,
+        )
 
         with patch("main.create_driver", return_value=fake_driver), \
              patch("main.wait_until_logged_in"), \
@@ -46,9 +52,12 @@ class TestMainFlowIntegration(unittest.TestCase):
              patch("main.get_grid_text", return_value=""), \
              patch("main.get_devexpress_pager_info", return_value={}), \
              patch("main.collect_grid_download_links", return_value=fake_links) as mock_collect, \
+             patch("main.StateManager") as MockStateManager, \
+             patch("main.build_download_queue", return_value=queue_result) as mock_build_queue, \
              patch("main.DownloadPlan") as MockPlan, \
              patch("main.DownloaderEngine") as MockEngine:
 
+            mock_state_manager_instance = MockStateManager.return_value
             mock_plan_instance = MockPlan.return_value
             mock_plan_instance.scheduled_count = 1
 
@@ -60,19 +69,28 @@ class TestMainFlowIntegration(unittest.TestCase):
             return {
                 "driver": fake_driver,
                 "mock_collect": mock_collect,
+                "MockStateManager": MockStateManager,
+                "mock_state_manager_instance": mock_state_manager_instance,
+                "mock_build_queue": mock_build_queue,
+                "queue_result": queue_result,
                 "MockPlan": MockPlan,
                 "mock_plan_instance": mock_plan_instance,
                 "MockEngine": MockEngine,
                 "mock_engine_instance": mock_engine_instance,
             }
 
-    def test_download_plan_built_from_queue(self):
-        """DownloadPlan must be instantiated with the DownloadQueue."""
+    def test_queue_is_built_from_scanned_links_and_state_manager(self):
+        """build_download_queue must receive scanned links and the state manager."""
         result = self._run_main()
-        result["MockPlan"].assert_called_once()
-        # The first positional argument should be a DownloadQueue instance
-        args, _ = result["MockPlan"].call_args
-        self.assertEqual(len(args), 1)
+        result["mock_build_queue"].assert_called_once_with(
+            result["mock_collect"].return_value,
+            state_manager=result["mock_state_manager_instance"],
+        )
+
+    def test_download_plan_built_from_filtered_queue(self):
+        """DownloadPlan must be instantiated with the filtered DownloadQueue."""
+        result = self._run_main()
+        result["MockPlan"].assert_called_once_with(result["queue_result"].queue, latest_only=False)
 
     def test_downloader_engine_run_called_with_plan(self):
         """DownloaderEngine.run() must be called with the plan instance."""
@@ -82,9 +100,12 @@ class TestMainFlowIntegration(unittest.TestCase):
         )
 
     def test_downloader_engine_instantiated_with_driver(self):
-        """DownloaderEngine must be instantiated with the Selenium driver."""
+        """DownloaderEngine must be instantiated with the Selenium driver and state manager."""
         result = self._run_main()
-        result["MockEngine"].assert_called_once_with(result["driver"])
+        result["MockEngine"].assert_called_once_with(
+            result["driver"],
+            state_manager=result["mock_state_manager_instance"],
+        )
 
     def test_driver_quit_called_on_success(self):
         """driver.quit() must always be called (finally block)."""
@@ -102,6 +123,9 @@ class TestMainFlowIntegration(unittest.TestCase):
 
         output = buf.getvalue()
         self.assertNotIn("当前仅排队，不执行下载", output)
+        self.assertIn("Found invoices: 1", output)
+        self.assertIn("Already completed: 1", output)
+        self.assertIn("Download Queue: 0", output)
 
 
 if __name__ == "__main__":

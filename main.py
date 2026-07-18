@@ -2,13 +2,14 @@ from config import BASE_URL
 from selenium.webdriver.common.by import By
 
 from ibis.browser import create_driver
-from ibis.downloader import DownloadQueue
+from ibis.downloader import build_download_queue
 from ibis.downloader_engine import DownloaderEngine
 from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_info
 from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
 from ibis.scheduler import DownloadPlan
+from ibis.state_manager import StateManager
 
 
 def main():
@@ -56,15 +57,18 @@ def main():
         print("==================================\n")
 
         all_links = collect_grid_download_links(driver, BASE_URL)
-        queue = DownloadQueue.from_links(all_links)
+        state_manager = StateManager()
+        queue_result = build_download_queue(all_links, state_manager=state_manager)
+        queue = queue_result.queue
 
-        print(f"所有分页共发现 {len(all_links)} 个下载链接。")
-        print(f"下载队列已创建，共 {len(queue)} 个项目。")
+        print(f"Found invoices: {queue_result.found_count}")
+        print(f"Already completed: {queue_result.already_completed_count}")
+        print(f"Download Queue: {len(queue)}")
 
-        plan = DownloadPlan(queue)
+        plan = DownloadPlan(queue, latest_only=False)
         print(f"下载计划已建立，共 {plan.scheduled_count} 个项目。")
 
-        engine = DownloaderEngine(driver)
+        engine = DownloaderEngine(driver, state_manager=state_manager)
         engine.run(plan)
 
     finally:
