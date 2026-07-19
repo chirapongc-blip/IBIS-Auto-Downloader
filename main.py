@@ -10,6 +10,7 @@ from config import (
 )
 from selenium.webdriver.common.by import By
 
+from ibis.auto_recovery import AutoRecovery
 from ibis.browser import create_driver
 from ibis.downloader import build_download_queue
 from ibis.downloader_engine import DownloaderEngine
@@ -17,7 +18,6 @@ from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_i
 from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
-from ibis.recovery import CrashRecoveryHandler, is_browser_failure
 from ibis.resume import has_interrupted_session, build_resume_queue
 from ibis.scheduler import DownloadPlan, Scheduler
 from ibis.period_tracker import PeriodTracker
@@ -40,6 +40,9 @@ def _download_workflow():
     resuming = has_interrupted_session(saved_state)
 
     driver = create_driver()
+    # _initial_driver is consumed by AutoRecovery on its first run; if an
+    # exception occurs before that happens the finally block drains it.
+    _initial_driver = [driver]
     state_manager = StateManager()
 
     try:
@@ -103,28 +106,35 @@ def _download_workflow():
         plan = DownloadPlan(queue, latest_only=False)
         print(f"下载计划已建立，共 {plan.scheduled_count} 个项目。")
 
-        engine = DownloaderEngine(driver, state_manager=state_manager, download_state=ds)
         period_tracker = PeriodTracker()
         current_period = latest_billing_period or plan.latest_billing_period
-        recovery_handler = CrashRecoveryHandler(download_state=ds)
-        try:
-            engine.run(plan)
-        except Exception as exc:
-            if is_browser_failure(exc):
-                report = recovery_handler.handle(exc)
-                print("=== Recovery Summary ===")
-                print(f"Timestamp:   {report.timestamp}")
-                print(f"Failure:     {report.exception_type}: {report.exception_message}")
-                print(f"Completed:   {report.completed_count}")
-                print(f"Pending:     {report.pending_count}")
-                print(f"Failed:      {report.failed_count}")
-                print(f"State file:  {report.state_file}")
-                print(f"Report:      {recovery_handler.report_file}")
-                print(f"Advice:      {report.recovery_advice}")
-                print("========================")
-                return
-            raise
-        if engine.summary.failed == 0 and current_period is not None:
+
+        # Capture the last engine created so its summary is accessible after run.
+        last_engine = [None]
+
+        def _engine_factory(d):
+            e = DownloaderEngine(d, state_manager=state_manager, download_state=ds)
+            last_engine[0] = e
+            return e
+
+        # Provide the already-logged-in scan driver on the first attempt; for
+        # any recovery attempt a fresh driver is created via create_driver().
+        def _driver_factory():
+            if _initial_driver:
+                return _initial_driver.pop()
+            return create_driver()
+
+        ar = AutoRecovery(
+            driver_factory=_driver_factory,
+            login_fn=wait_until_logged_in,
+            open_invoice_fn=open_invoice_page,
+            download_state=ds,
+            engine_factory=_engine_factory,
+        )
+        ar.run(plan)
+
+        engine = last_engine[0]
+        if engine is not None and engine.summary.failed == 0 and current_period is not None:
             if len(queue) == 0:
                 if not period_tracker.last_period_file_exists():
                     period_tracker.save_last_period(current_period)
@@ -132,7 +142,11 @@ def _download_workflow():
                 period_tracker.save_last_period(current_period)
 
     finally:
-        driver.quit()
+        # AutoRecovery quits its own driver when run() returns or raises.
+        # Only quit here if AutoRecovery never consumed the initial driver
+        # (i.e. an exception occurred before ar.run() was reached).
+        if _initial_driver:
+            driver.quit()
 
 
 def main():
