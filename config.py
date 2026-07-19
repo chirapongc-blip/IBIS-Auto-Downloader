@@ -13,6 +13,9 @@ LOG_DIR = PROJECT_ROOT / "logs"
 # State folder
 STATE_DIR = PROJECT_ROOT / "state"
 
+# Reports folder (Build 3.1)
+REPORTS_DIR = PROJECT_ROOT / "reports"
+
 # IBIS URL
 BASE_URL = "https://stationsatcom.satcomhost.com"
 
