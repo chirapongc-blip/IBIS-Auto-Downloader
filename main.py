@@ -17,6 +17,7 @@ from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_i
 from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
+from ibis.recovery import CrashRecoveryHandler, is_browser_failure
 from ibis.resume import has_interrupted_session, build_resume_queue
 from ibis.scheduler import DownloadPlan, Scheduler
 from ibis.period_tracker import PeriodTracker
@@ -105,7 +106,24 @@ def _download_workflow():
         engine = DownloaderEngine(driver, state_manager=state_manager, download_state=ds)
         period_tracker = PeriodTracker()
         current_period = latest_billing_period or plan.latest_billing_period
-        engine.run(plan)
+        recovery_handler = CrashRecoveryHandler(download_state=ds)
+        try:
+            engine.run(plan)
+        except Exception as exc:
+            if is_browser_failure(exc):
+                report = recovery_handler.handle(exc)
+                print("=== Recovery Summary ===")
+                print(f"Timestamp:   {report.timestamp}")
+                print(f"Failure:     {report.exception_type}: {report.exception_message}")
+                print(f"Completed:   {report.completed_count}")
+                print(f"Pending:     {report.pending_count}")
+                print(f"Failed:      {report.failed_count}")
+                print(f"State file:  {report.state_file}")
+                print(f"Report:      {recovery_handler.report_file}")
+                print(f"Advice:      {report.recovery_advice}")
+                print("========================")
+                return
+            raise
         if engine.summary.failed == 0 and current_period is not None:
             if len(queue) == 0:
                 if not period_tracker.last_period_file_exists():

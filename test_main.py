@@ -373,5 +373,491 @@ class TestMainScheduledModeResilience(unittest.TestCase):
         )
 
 
+class TestMainRecoveryIntegration(unittest.TestCase):
+    """Verify that _download_workflow integrates with CrashRecoveryHandler
+    when engine.run() raises a browser/session failure."""
+
+    # Fake browser exception recognised by is_browser_failure via name-based lookup.
+    _FakeBrowserError = type("WebDriverException", (Exception,), {})
+
+    def _build_patches(self, engine_side_effect=None, scheduled_count=2):
+        """Return a dict of all patches needed to drive _download_workflow."""
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        from types import SimpleNamespace
+        queue = MagicMock()
+        queue.__len__.return_value = scheduled_count
+        queue_result = SimpleNamespace(
+            queue=queue,
+            found_count=scheduled_count,
+            already_completed_count=0,
+            latest_billing_period="202605",
+        )
+
+        return {
+            "create_driver": patch("main.create_driver", return_value=fake_driver),
+            "wait_until_logged_in": patch("main.wait_until_logged_in"),
+            "open_invoice_page": patch("main.open_invoice_page", return_value=""),
+            "builtins_open": patch("builtins.open", unittest.mock.mock_open()),
+            "wait_for_grid": patch("main.wait_for_grid"),
+            "count_grid_rows": patch("main.count_grid_rows", return_value=1),
+            "get_grid_text": patch("main.get_grid_text", return_value=""),
+            "get_devexpress_pager_info": patch("main.get_devexpress_pager_info", return_value={}),
+            "collect_grid_download_links": patch("main.collect_grid_download_links", return_value=[]),
+            "StateManager": patch("main.StateManager"),
+            "build_download_queue": patch("main.build_download_queue", return_value=queue_result),
+            "DownloadPlan": patch("main.DownloadPlan"),
+            "DownloaderEngine": patch("main.DownloaderEngine"),
+            "PeriodTracker": patch("main.PeriodTracker"),
+            "DownloadState": patch("main.DownloadState"),
+            "CrashRecoveryHandler": patch("main.CrashRecoveryHandler"),
+            "is_browser_failure": patch("main.is_browser_failure"),
+            "_fake_driver": fake_driver,
+            "_queue_result": queue_result,
+            "_engine_side_effect": engine_side_effect,
+        }
+
+    def _run_with_patches(self, patches, engine_side_effect=None, scheduled_count=2):
+        """Enter all patches and run main(), returning relevant mocks."""
+        cms = {k: v for k, v in patches.items()
+               if not k.startswith("_") and hasattr(v, "__enter__")}
+        active = {k: v.__enter__() for k, v in cms.items()}
+
+        mock_plan = active["DownloadPlan"].return_value
+        mock_plan.scheduled_count = scheduled_count
+        mock_plan.latest_billing_period = "202605"
+
+        mock_engine = active["DownloaderEngine"].return_value
+        if engine_side_effect is not None:
+            mock_engine.run.side_effect = engine_side_effect
+        else:
+            mock_engine.summary = SimpleNamespace(completed=0, failed=0)
+
+        mock_ds = active["DownloadState"].return_value
+        mock_ds.load_state.return_value = {}
+
+        active["PeriodTracker"].return_value.last_period_file_exists.return_value = True
+
+        try:
+            import main
+            main.main()
+        finally:
+            for v in reversed(list(cms.values())):
+                v.__exit__(None, None, None)
+
+        return active
+
+    def test_browser_failure_triggers_recovery_handler(self):
+        """CrashRecoveryHandler.handle() must be called on a browser failure."""
+        exc = self._FakeBrowserError("session crashed")
+
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        from types import SimpleNamespace
+        queue = MagicMock()
+        queue.__len__.return_value = 1
+        queue_result = SimpleNamespace(
+            queue=queue, found_count=1, already_completed_count=0, latest_billing_period="202605"
+        )
+
+        mock_recovery_handler = MagicMock()
+        mock_report = MagicMock()
+        mock_report.timestamp = "2026-01-01T00:00:00+00:00"
+        mock_report.exception_type = "WebDriverException"
+        mock_report.exception_message = "session crashed"
+        mock_report.completed_count = 0
+        mock_report.pending_count = 1
+        mock_report.failed_count = 0
+        mock_report.state_file = "state/download_state.json"
+        mock_report.recovery_advice = "Restart to resume."
+        mock_recovery_handler.handle.return_value = mock_report
+        mock_recovery_handler.report_file = "state/recovery_report.json"
+
+        with patch("main.create_driver", return_value=fake_driver), \
+             patch("main.wait_until_logged_in"), \
+             patch("main.open_invoice_page", return_value=""), \
+             patch("builtins.open", unittest.mock.mock_open()), \
+             patch("main.wait_for_grid"), \
+             patch("main.count_grid_rows", return_value=1), \
+             patch("main.get_grid_text", return_value=""), \
+             patch("main.get_devexpress_pager_info", return_value={}), \
+             patch("main.collect_grid_download_links", return_value=[]), \
+             patch("main.StateManager"), \
+             patch("main.build_download_queue", return_value=queue_result), \
+             patch("main.DownloadPlan") as MockPlan, \
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker"), \
+             patch("main.DownloadState") as MockDS, \
+             patch("main.CrashRecoveryHandler", return_value=mock_recovery_handler), \
+             patch("main.is_browser_failure", return_value=True):
+
+            MockPlan.return_value.scheduled_count = 1
+            MockPlan.return_value.latest_billing_period = "202605"
+            MockEngine.return_value.run.side_effect = exc
+            MockDS.return_value.load_state.return_value = {}
+
+            import main
+            main.main()
+
+        mock_recovery_handler.handle.assert_called_once_with(exc)
+
+    def test_browser_failure_prints_recovery_summary(self):
+        """A recovery summary must be printed to stdout on browser failure."""
+        import io
+        from contextlib import redirect_stdout
+
+        exc = self._FakeBrowserError("window gone")
+
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        from types import SimpleNamespace
+        queue = MagicMock()
+        queue.__len__.return_value = 1
+        queue_result = SimpleNamespace(
+            queue=queue, found_count=1, already_completed_count=0, latest_billing_period="202605"
+        )
+
+        mock_recovery_handler = MagicMock()
+        mock_report = MagicMock()
+        mock_report.timestamp = "2026-01-01T00:00:00+00:00"
+        mock_report.exception_type = "WebDriverException"
+        mock_report.exception_message = "window gone"
+        mock_report.completed_count = 3
+        mock_report.pending_count = 5
+        mock_report.failed_count = 1
+        mock_report.state_file = "state/download_state.json"
+        mock_report.recovery_advice = "Restart to resume."
+        mock_recovery_handler.handle.return_value = mock_report
+        mock_recovery_handler.report_file = "state/recovery_report.json"
+
+        buf = io.StringIO()
+        with redirect_stdout(buf), \
+             patch("main.create_driver", return_value=fake_driver), \
+             patch("main.wait_until_logged_in"), \
+             patch("main.open_invoice_page", return_value=""), \
+             patch("builtins.open", unittest.mock.mock_open()), \
+             patch("main.wait_for_grid"), \
+             patch("main.count_grid_rows", return_value=1), \
+             patch("main.get_grid_text", return_value=""), \
+             patch("main.get_devexpress_pager_info", return_value={}), \
+             patch("main.collect_grid_download_links", return_value=[]), \
+             patch("main.StateManager"), \
+             patch("main.build_download_queue", return_value=queue_result), \
+             patch("main.DownloadPlan") as MockPlan, \
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker"), \
+             patch("main.DownloadState") as MockDS, \
+             patch("main.CrashRecoveryHandler", return_value=mock_recovery_handler), \
+             patch("main.is_browser_failure", return_value=True):
+
+            MockPlan.return_value.scheduled_count = 1
+            MockPlan.return_value.latest_billing_period = "202605"
+            MockEngine.return_value.run.side_effect = exc
+            MockDS.return_value.load_state.return_value = {}
+
+            import main
+            main.main()
+
+        output = buf.getvalue()
+        self.assertIn("Recovery Summary", output)
+        self.assertIn("WebDriverException", output)
+        self.assertIn("window gone", output)
+        self.assertIn("3", output)   # completed_count
+        self.assertIn("5", output)   # pending_count
+        self.assertIn("1", output)   # failed_count
+        self.assertIn("state/recovery_report.json", output)
+        self.assertIn("Restart to resume.", output)
+
+    def test_non_browser_exception_is_reraised(self):
+        """Non-browser exceptions must be re-raised without recovery handling."""
+        exc = RuntimeError("disk full")
+
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        from types import SimpleNamespace
+        queue = MagicMock()
+        queue.__len__.return_value = 1
+        queue_result = SimpleNamespace(
+            queue=queue, found_count=1, already_completed_count=0, latest_billing_period="202605"
+        )
+
+        mock_recovery_handler = MagicMock()
+
+        with patch("main.create_driver", return_value=fake_driver), \
+             patch("main.wait_until_logged_in"), \
+             patch("main.open_invoice_page", return_value=""), \
+             patch("builtins.open", unittest.mock.mock_open()), \
+             patch("main.wait_for_grid"), \
+             patch("main.count_grid_rows", return_value=1), \
+             patch("main.get_grid_text", return_value=""), \
+             patch("main.get_devexpress_pager_info", return_value={}), \
+             patch("main.collect_grid_download_links", return_value=[]), \
+             patch("main.StateManager"), \
+             patch("main.build_download_queue", return_value=queue_result), \
+             patch("main.DownloadPlan") as MockPlan, \
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker"), \
+             patch("main.DownloadState") as MockDS, \
+             patch("main.CrashRecoveryHandler", return_value=mock_recovery_handler), \
+             patch("main.is_browser_failure", return_value=False):
+
+            MockPlan.return_value.scheduled_count = 1
+            MockPlan.return_value.latest_billing_period = "202605"
+            MockEngine.return_value.run.side_effect = exc
+            MockDS.return_value.load_state.return_value = {}
+
+            import main
+            with self.assertRaises(RuntimeError) as ctx:
+                main.main()
+
+        self.assertIs(ctx.exception, exc)
+        mock_recovery_handler.handle.assert_not_called()
+
+    def test_browser_failure_driver_quit_still_called(self):
+        """driver.quit() must still be called after a browser failure is handled."""
+        exc = self._FakeBrowserError("crash")
+
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        from types import SimpleNamespace
+        queue = MagicMock()
+        queue.__len__.return_value = 1
+        queue_result = SimpleNamespace(
+            queue=queue, found_count=1, already_completed_count=0, latest_billing_period="202605"
+        )
+
+        mock_recovery_handler = MagicMock()
+        mock_report = MagicMock()
+        mock_report.timestamp = "t"
+        mock_report.exception_type = "WebDriverException"
+        mock_report.exception_message = "crash"
+        mock_report.completed_count = 0
+        mock_report.pending_count = 0
+        mock_report.failed_count = 0
+        mock_report.state_file = None
+        mock_report.recovery_advice = ""
+        mock_recovery_handler.handle.return_value = mock_report
+        mock_recovery_handler.report_file = "state/recovery_report.json"
+
+        with patch("main.create_driver", return_value=fake_driver), \
+             patch("main.wait_until_logged_in"), \
+             patch("main.open_invoice_page", return_value=""), \
+             patch("builtins.open", unittest.mock.mock_open()), \
+             patch("main.wait_for_grid"), \
+             patch("main.count_grid_rows", return_value=1), \
+             patch("main.get_grid_text", return_value=""), \
+             patch("main.get_devexpress_pager_info", return_value={}), \
+             patch("main.collect_grid_download_links", return_value=[]), \
+             patch("main.StateManager"), \
+             patch("main.build_download_queue", return_value=queue_result), \
+             patch("main.DownloadPlan") as MockPlan, \
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker"), \
+             patch("main.DownloadState") as MockDS, \
+             patch("main.CrashRecoveryHandler", return_value=mock_recovery_handler), \
+             patch("main.is_browser_failure", return_value=True):
+
+            MockPlan.return_value.scheduled_count = 1
+            MockPlan.return_value.latest_billing_period = "202605"
+            MockEngine.return_value.run.side_effect = exc
+            MockDS.return_value.load_state.return_value = {}
+
+            import main
+            main.main()
+
+        fake_driver.quit.assert_called_once()
+
+    def test_crash_recovery_handler_receives_download_state(self):
+        """CrashRecoveryHandler must be instantiated with the DownloadState object."""
+        exc = self._FakeBrowserError("session gone")
+
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        from types import SimpleNamespace
+        queue = MagicMock()
+        queue.__len__.return_value = 1
+        queue_result = SimpleNamespace(
+            queue=queue, found_count=1, already_completed_count=0, latest_billing_period="202605"
+        )
+
+        mock_report = MagicMock()
+        mock_report.timestamp = "t"
+        mock_report.exception_type = "WebDriverException"
+        mock_report.exception_message = "session gone"
+        mock_report.completed_count = 0
+        mock_report.pending_count = 0
+        mock_report.failed_count = 0
+        mock_report.state_file = None
+        mock_report.recovery_advice = ""
+
+        mock_handler_instance = MagicMock()
+        mock_handler_instance.handle.return_value = mock_report
+        mock_handler_instance.report_file = "state/recovery_report.json"
+
+        with patch("main.create_driver", return_value=fake_driver), \
+             patch("main.wait_until_logged_in"), \
+             patch("main.open_invoice_page", return_value=""), \
+             patch("builtins.open", unittest.mock.mock_open()), \
+             patch("main.wait_for_grid"), \
+             patch("main.count_grid_rows", return_value=1), \
+             patch("main.get_grid_text", return_value=""), \
+             patch("main.get_devexpress_pager_info", return_value={}), \
+             patch("main.collect_grid_download_links", return_value=[]), \
+             patch("main.StateManager"), \
+             patch("main.build_download_queue", return_value=queue_result), \
+             patch("main.DownloadPlan") as MockPlan, \
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker"), \
+             patch("main.DownloadState") as MockDS, \
+             patch("main.CrashRecoveryHandler", return_value=mock_handler_instance) as MockCRH, \
+             patch("main.is_browser_failure", return_value=True):
+
+            mock_ds_instance = MockDS.return_value
+            mock_ds_instance.load_state.return_value = {}
+            MockPlan.return_value.scheduled_count = 1
+            MockPlan.return_value.latest_billing_period = "202605"
+            MockEngine.return_value.run.side_effect = exc
+
+            import main
+            main.main()
+
+        MockCRH.assert_called_once_with(download_state=mock_ds_instance)
+
+    def test_period_tracker_not_called_on_browser_failure(self):
+        """PeriodTracker.save_last_period() must NOT be called when recovery handles the crash."""
+        exc = self._FakeBrowserError("window closed")
+
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        from types import SimpleNamespace
+        queue = MagicMock()
+        queue.__len__.return_value = 2
+        queue_result = SimpleNamespace(
+            queue=queue, found_count=2, already_completed_count=0, latest_billing_period="202605"
+        )
+
+        mock_report = MagicMock()
+        mock_report.timestamp = "t"
+        mock_report.exception_type = "WebDriverException"
+        mock_report.exception_message = "window closed"
+        mock_report.completed_count = 1
+        mock_report.pending_count = 1
+        mock_report.failed_count = 0
+        mock_report.state_file = None
+        mock_report.recovery_advice = ""
+
+        mock_handler = MagicMock()
+        mock_handler.handle.return_value = mock_report
+        mock_handler.report_file = "state/recovery_report.json"
+
+        with patch("main.create_driver", return_value=fake_driver), \
+             patch("main.wait_until_logged_in"), \
+             patch("main.open_invoice_page", return_value=""), \
+             patch("builtins.open", unittest.mock.mock_open()), \
+             patch("main.wait_for_grid"), \
+             patch("main.count_grid_rows", return_value=1), \
+             patch("main.get_grid_text", return_value=""), \
+             patch("main.get_devexpress_pager_info", return_value={}), \
+             patch("main.collect_grid_download_links", return_value=[]), \
+             patch("main.StateManager"), \
+             patch("main.build_download_queue", return_value=queue_result), \
+             patch("main.DownloadPlan") as MockPlan, \
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker") as MockPT, \
+             patch("main.DownloadState") as MockDS, \
+             patch("main.CrashRecoveryHandler", return_value=mock_handler), \
+             patch("main.is_browser_failure", return_value=True):
+
+            MockPlan.return_value.scheduled_count = 2
+            MockPlan.return_value.latest_billing_period = "202605"
+            MockEngine.return_value.run.side_effect = exc
+            MockDS.return_value.load_state.return_value = {}
+
+            import main
+            main.main()
+
+        MockPT.return_value.save_last_period.assert_not_called()
+
+    def test_recovery_logic_separate_from_downloader_engine(self):
+        """Recovery handling must occur in main, not inside DownloaderEngine.
+
+        The engine simply raises; main.py catches it via is_browser_failure and
+        delegates to CrashRecoveryHandler.  No recovery method is called on the
+        engine instance itself.
+        """
+        exc = self._FakeBrowserError("crash mid-run")
+
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        from types import SimpleNamespace
+        queue = MagicMock()
+        queue.__len__.return_value = 1
+        queue_result = SimpleNamespace(
+            queue=queue, found_count=1, already_completed_count=0, latest_billing_period="202605"
+        )
+
+        mock_report = MagicMock()
+        mock_report.timestamp = "t"
+        mock_report.exception_type = "WebDriverException"
+        mock_report.exception_message = "crash mid-run"
+        mock_report.completed_count = 0
+        mock_report.pending_count = 0
+        mock_report.failed_count = 0
+        mock_report.state_file = None
+        mock_report.recovery_advice = ""
+
+        mock_handler = MagicMock()
+        mock_handler.handle.return_value = mock_report
+        mock_handler.report_file = "state/recovery_report.json"
+
+        with patch("main.create_driver", return_value=fake_driver), \
+             patch("main.wait_until_logged_in"), \
+             patch("main.open_invoice_page", return_value=""), \
+             patch("builtins.open", unittest.mock.mock_open()), \
+             patch("main.wait_for_grid"), \
+             patch("main.count_grid_rows", return_value=1), \
+             patch("main.get_grid_text", return_value=""), \
+             patch("main.get_devexpress_pager_info", return_value={}), \
+             patch("main.collect_grid_download_links", return_value=[]), \
+             patch("main.StateManager"), \
+             patch("main.build_download_queue", return_value=queue_result), \
+             patch("main.DownloadPlan") as MockPlan, \
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker"), \
+             patch("main.DownloadState") as MockDS, \
+             patch("main.CrashRecoveryHandler", return_value=mock_handler), \
+             patch("main.is_browser_failure", return_value=True):
+
+            MockPlan.return_value.scheduled_count = 1
+            MockPlan.return_value.latest_billing_period = "202605"
+            MockEngine.return_value.run.side_effect = exc
+            MockDS.return_value.load_state.return_value = {}
+
+            import main
+            main.main()
+
+        # Recovery was handled by CrashRecoveryHandler (not DownloaderEngine).
+        mock_handler.handle.assert_called_once()
+        # DownloaderEngine.run() raised; no extra calls were made on it for recovery.
+        engine_instance = MockEngine.return_value
+        self.assertEqual(engine_instance.run.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
