@@ -58,16 +58,19 @@ def is_retryable(exc):
 
 
 class DownloaderEngine:
-    def __init__(self, driver, *, download_dir=None, timeout=60, poll_interval=0.2, state_manager=None):
+    def __init__(self, driver, *, download_dir=None, timeout=60, poll_interval=0.2, state_manager=None, download_state=None):
         self.driver = driver
         self.download_dir = Path(download_dir) if download_dir is not None else get_download_dir()
         self.timeout = timeout
         self.poll_interval = poll_interval
         self.state_manager = state_manager
+        self.download_state = download_state
         self.summary = DownloadSummary()
 
     def run(self, plan):
         self.summary = DownloadSummary(total_files=len(plan.scheduled_items))
+        if self.download_state is not None:
+            self.download_state.initialize(plan.scheduled_items)
         started_at = time.monotonic()
         for item in plan.scheduled_items:
             self._download_item(item)
@@ -199,8 +202,12 @@ class DownloaderEngine:
         self._set_status(item, status)
         if status == STATUS_COMPLETED:
             self.summary.completed += 1
+            if self.download_state is not None:
+                self.download_state.mark_completed(item)
         elif status == STATUS_FAILED:
             self.summary.failed += 1
+            if self.download_state is not None:
+                self.download_state.mark_failed(item)
         elif status == STATUS_SKIPPED:
             self.summary.skipped += 1
 
