@@ -17,17 +17,29 @@ from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_i
 from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
 from ibis.login import wait_until_logged_in
+from ibis.resume import has_interrupted_session, build_resume_queue
 from ibis.scheduler import DownloadPlan, Scheduler
 from ibis.period_tracker import PeriodTracker
+from ibis.state import DownloadState
 from ibis.state_manager import StateManager
 
 logger = logging.getLogger(__name__)
 
 
 def _download_workflow():
-    """Execute the full Build 2.5 download workflow (one pass)."""
+    """Execute the full Build 2.5 download workflow (one pass).
+
+    If ``state/download_state.json`` records an interrupted session the
+    download queue is restored from that file (pending and failed items only)
+    and the grid-scanning step is skipped.  All other behaviour is preserved.
+    """
+
+    ds = DownloadState()
+    saved_state = ds.load_state()
+    resuming = has_interrupted_session(saved_state)
 
     driver = create_driver()
+    state_manager = StateManager()
 
     try:
         driver.get(BASE_URL)
@@ -36,53 +48,63 @@ def _download_workflow():
         wait_until_logged_in(driver)
 
         print("登录成功。")
-        print("正在打开 Invoice 页面...")
 
-        html = open_invoice_page(driver)
+        if resuming:
+            print("Resuming interrupted download session...")
+            queue = build_resume_queue(saved_state)
+            latest_billing_period = saved_state.get("billing_period")
+            already_completed_count = len(saved_state.get("completed", []))
+            found_count = len(saved_state.get("queue", []))
+        else:
+            print("正在打开 Invoice 页面...")
 
-        with open("invoice_page.html", "w", encoding="utf-8") as f:
-            f.write(html)
+            html = open_invoice_page(driver)
 
-        wait_for_grid(driver)
+            with open("invoice_page.html", "w", encoding="utf-8") as f:
+                f.write(html)
 
-        anchors = driver.find_elements(
-            By.CSS_SELECTOR,
-            "a[href*='DownloadARExport.aspx']"
-        )
+            wait_for_grid(driver)
 
-        print("Selenium found:", len(anchors))
+            anchors = driver.find_elements(
+                By.CSS_SELECTOR,
+                "a[href*='DownloadARExport.aspx']"
+            )
 
-        for a in anchors[:5]:
-            print(a.get_attribute("href"))
+            print("Selenium found:", len(anchors))
 
-        html2 = driver.page_source
+            for a in anchors[:5]:
+                print(a.get_attribute("href"))
 
-        with open("invoice_after_wait.html", "w", encoding="utf-8") as f:
-            f.write(html2)
+            html2 = driver.page_source
 
-        print("After wait:", html2.count("DownloadARExport.aspx"))
-        print("Pager info:", get_devexpress_pager_info(html2))
+            with open("invoice_after_wait.html", "w", encoding="utf-8") as f:
+                f.write(html2)
 
-        print(f"Grid TR 数量：{count_grid_rows(driver)}")
-        print("\n========== Grid Preview ==========")
-        print(get_grid_text(driver)[:1000])
-        print("==================================\n")
+            print("After wait:", html2.count("DownloadARExport.aspx"))
+            print("Pager info:", get_devexpress_pager_info(html2))
 
-        all_links = collect_grid_download_links(driver, BASE_URL)
-        state_manager = StateManager()
-        queue_result = build_download_queue(all_links, state_manager=state_manager)
-        queue = queue_result.queue
+            print(f"Grid TR 数量：{count_grid_rows(driver)}")
+            print("\n========== Grid Preview ==========")
+            print(get_grid_text(driver)[:1000])
+            print("==================================\n")
 
-        print(f"Found invoices: {queue_result.found_count}")
-        print(f"Already completed: {queue_result.already_completed_count}")
+            all_links = collect_grid_download_links(driver, BASE_URL)
+            queue_result = build_download_queue(all_links, state_manager=state_manager)
+            queue = queue_result.queue
+            latest_billing_period = queue_result.latest_billing_period
+            found_count = queue_result.found_count
+            already_completed_count = queue_result.already_completed_count
+
+        print(f"Found invoices: {found_count}")
+        print(f"Already completed: {already_completed_count}")
         print(f"Download Queue: {len(queue)}")
 
         plan = DownloadPlan(queue, latest_only=False)
         print(f"下载计划已建立，共 {plan.scheduled_count} 个项目。")
 
-        engine = DownloaderEngine(driver, state_manager=state_manager)
+        engine = DownloaderEngine(driver, state_manager=state_manager, download_state=ds)
         period_tracker = PeriodTracker()
-        current_period = queue_result.latest_billing_period or plan.latest_billing_period
+        current_period = latest_billing_period or plan.latest_billing_period
         engine.run(plan)
         if engine.summary.failed == 0 and current_period is not None:
             if len(queue) == 0:

@@ -68,7 +68,8 @@ class TestMainFlowIntegration(unittest.TestCase):
              patch("main.build_download_queue", return_value=queue_result) as mock_build_queue, \
              patch("main.DownloadPlan") as MockPlan, \
              patch("main.DownloaderEngine") as MockEngine, \
-             patch("main.PeriodTracker") as MockPeriodTracker:
+             patch("main.PeriodTracker") as MockPeriodTracker, \
+             patch("main.DownloadState") as MockDownloadState:
 
             mock_state_manager_instance = MockStateManager.return_value
             mock_plan_instance = MockPlan.return_value
@@ -79,6 +80,9 @@ class TestMainFlowIntegration(unittest.TestCase):
             mock_engine_instance.summary = SimpleNamespace(completed=completed, failed=failed)
             mock_period_tracker_instance = MockPeriodTracker.return_value
             mock_period_tracker_instance.last_period_file_exists.return_value = period_file_exists
+
+            mock_ds_instance = MockDownloadState.return_value
+            mock_ds_instance.load_state.return_value = {}  # No interrupted session
 
             import main
             main.main()
@@ -96,6 +100,8 @@ class TestMainFlowIntegration(unittest.TestCase):
                 "mock_engine_instance": mock_engine_instance,
                 "MockPeriodTracker": MockPeriodTracker,
                 "mock_period_tracker_instance": mock_period_tracker_instance,
+                "MockDownloadState": MockDownloadState,
+                "mock_ds_instance": mock_ds_instance,
             }
 
     def test_queue_is_built_from_scanned_links_and_state_manager(self):
@@ -119,11 +125,12 @@ class TestMainFlowIntegration(unittest.TestCase):
         )
 
     def test_downloader_engine_instantiated_with_driver(self):
-        """DownloaderEngine must be instantiated with the Selenium driver and state manager."""
+        """DownloaderEngine must be instantiated with the Selenium driver, state manager, and download state."""
         result = self._run_main()
         result["MockEngine"].assert_called_once_with(
             result["driver"],
             state_manager=result["mock_state_manager_instance"],
+            download_state=result["mock_ds_instance"],
         )
 
     def test_driver_quit_called_on_success(self):
@@ -200,6 +207,122 @@ class TestMainFlowIntegration(unittest.TestCase):
             period_file_exists=True,
         )
         result["mock_period_tracker_instance"].save_last_period.assert_not_called()
+
+
+class TestMainResumeIntegration(unittest.TestCase):
+    """Verify that _download_workflow skips grid scanning when an interrupted
+    session is detected and uses the resume queue instead."""
+
+    def _run_main_with_resume(self, saved_state, *, scheduled_count=1, completed=1, failed=0):
+        """Run main() with a pre-configured saved state that triggers resume."""
+        fake_driver = MagicMock()
+        fake_driver.page_source = ""
+        fake_driver.find_elements.return_value = []
+
+        resume_queue = MagicMock()
+        resume_queue.__len__.return_value = scheduled_count
+
+        with patch("main.create_driver", return_value=fake_driver), \
+             patch("main.wait_until_logged_in"), \
+             patch("main.StateManager"), \
+             patch("main.DownloadPlan") as MockPlan, \
+             patch("main.DownloaderEngine") as MockEngine, \
+             patch("main.PeriodTracker") as MockPeriodTracker, \
+             patch("main.DownloadState") as MockDownloadState, \
+             patch("main.has_interrupted_session", return_value=True), \
+             patch("main.build_resume_queue", return_value=resume_queue) as mock_build_resume, \
+             patch("main.build_download_queue") as mock_build_queue, \
+             patch("main.collect_grid_download_links") as mock_collect:
+
+            mock_ds_instance = MockDownloadState.return_value
+            mock_ds_instance.load_state.return_value = saved_state
+
+            mock_plan_instance = MockPlan.return_value
+            mock_plan_instance.scheduled_count = scheduled_count
+            mock_plan_instance.latest_billing_period = saved_state.get("billing_period")
+
+            mock_engine_instance = MockEngine.return_value
+            mock_engine_instance.summary = SimpleNamespace(completed=completed, failed=failed)
+            mock_period_tracker_instance = MockPeriodTracker.return_value
+            mock_period_tracker_instance.last_period_file_exists.return_value = True
+
+            import main
+            main.main()
+
+            return {
+                "driver": fake_driver,
+                "mock_collect": mock_collect,
+                "mock_build_queue": mock_build_queue,
+                "mock_build_resume": mock_build_resume,
+                "MockPlan": MockPlan,
+                "mock_plan_instance": mock_plan_instance,
+                "MockEngine": MockEngine,
+                "mock_engine_instance": mock_engine_instance,
+                "MockDownloadState": MockDownloadState,
+                "mock_ds_instance": mock_ds_instance,
+            }
+
+    def _make_interrupted_state(self, billing_period="202605"):
+        return {
+            "billing_period": billing_period,
+            "customer_id": None,
+            "invoice_id": None,
+            "queue": [
+                {"invoice_id": "1001", "billing_period": billing_period,
+                 "download_url": "https://example.com/dl?InvoiceID=1001",
+                 "filename": None, "retry_count": 0, "last_error": None,
+                 "download_status": "pending"},
+                {"invoice_id": "1002", "billing_period": billing_period,
+                 "download_url": "https://example.com/dl?InvoiceID=1002",
+                 "filename": None, "retry_count": 0, "last_error": None,
+                 "download_status": "pending"},
+            ],
+            "completed": [
+                {"invoice_id": "1001", "billing_period": billing_period,
+                 "download_url": "https://example.com/dl?InvoiceID=1001",
+                 "filename": "202605_1001.xlsx", "retry_count": 0,
+                 "last_error": None, "download_status": "completed"},
+            ],
+            "failed": [],
+        }
+
+    def test_resume_skips_grid_scanning(self):
+        """When resuming, grid scanning must NOT be called."""
+        saved_state = self._make_interrupted_state()
+        result = self._run_main_with_resume(saved_state)
+        result["mock_collect"].assert_not_called()
+        result["mock_build_queue"].assert_not_called()
+
+    def test_resume_calls_build_resume_queue_with_saved_state(self):
+        """build_resume_queue must be called with the loaded state dict."""
+        saved_state = self._make_interrupted_state()
+        result = self._run_main_with_resume(saved_state)
+        result["mock_build_resume"].assert_called_once_with(saved_state)
+
+    def test_resume_passes_download_state_to_engine(self):
+        """DownloaderEngine must receive the DownloadState instance during resume."""
+        saved_state = self._make_interrupted_state()
+        result = self._run_main_with_resume(saved_state)
+        _, kwargs = result["MockEngine"].call_args
+        self.assertIs(kwargs.get("download_state"), result["mock_ds_instance"])
+
+    def test_resume_engine_runs_with_plan_from_resume_queue(self):
+        """DownloaderEngine.run() must be called with a plan built from the resume queue."""
+        saved_state = self._make_interrupted_state()
+        result = self._run_main_with_resume(saved_state)
+        result["mock_engine_instance"].run.assert_called_once_with(result["mock_plan_instance"])
+
+    def test_resume_prints_resuming_message(self):
+        """The workflow must print a resuming message when an interrupted session is found."""
+        import io
+        from contextlib import redirect_stdout
+
+        saved_state = self._make_interrupted_state()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self._run_main_with_resume(saved_state)
+
+        self.assertIn("Resuming interrupted download session", buf.getvalue())
 
 
 class TestMainScheduledModeResilience(unittest.TestCase):
