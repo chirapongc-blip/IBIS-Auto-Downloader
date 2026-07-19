@@ -1,4 +1,12 @@
-from config import BASE_URL, VERSION
+from config import (
+    BASE_URL,
+    VERSION,
+    SCHEDULER_ENABLED,
+    SCHEDULER_MODE,
+    SCHEDULE_DAY,
+    SCHEDULE_HOUR,
+    SCHEDULE_MINUTE,
+)
 from selenium.webdriver.common.by import By
 
 from ibis.browser import create_driver
@@ -85,8 +93,29 @@ def _download_workflow():
 
 
 def main():
-    scheduler = Scheduler(_download_workflow)
-    scheduler.run_once()
+    if not SCHEDULER_ENABLED:
+        # Build 2.6 behaviour: run once and exit.
+        scheduler = Scheduler(_download_workflow)
+        scheduler.run_once()
+        return
+
+    # Build 2.7: use configurable schedule.
+    scheduler = Scheduler(
+        _download_workflow,
+        mode=SCHEDULER_MODE,
+        schedule_day=SCHEDULE_DAY,
+        schedule_hour=SCHEDULE_HOUR,
+        schedule_minute=SCHEDULE_MINUTE,
+        run_immediately=(SCHEDULER_MODE == "immediate"),
+    )
+
+    if SCHEDULER_MODE == "immediate":
+        if scheduler.should_run_now():
+            scheduler.run_once()
+    else:
+        while True:
+            scheduler.wait_until_next_run()
+            scheduler.run_once()
 
 
 if __name__ == "__main__":
