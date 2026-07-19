@@ -1,3 +1,4 @@
+import logging
 from config import (
     BASE_URL,
     VERSION,
@@ -19,6 +20,8 @@ from ibis.login import wait_until_logged_in
 from ibis.scheduler import DownloadPlan, Scheduler
 from ibis.period_tracker import PeriodTracker
 from ibis.state_manager import StateManager
+
+logger = logging.getLogger(__name__)
 
 
 def _download_workflow():
@@ -115,7 +118,10 @@ def main():
     else:
         while True:
             scheduler.wait_until_next_run()
-            scheduler.run_once()
+            try:
+                scheduler.run_once()
+            except Exception:
+                logger.exception("Scheduled workflow execution failed; waiting for next run.")
 
 
 if __name__ == "__main__":

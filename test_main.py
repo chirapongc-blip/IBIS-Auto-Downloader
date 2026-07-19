@@ -202,5 +202,53 @@ class TestMainFlowIntegration(unittest.TestCase):
         result["mock_period_tracker_instance"].save_last_period.assert_not_called()
 
 
+class TestMainScheduledModeResilience(unittest.TestCase):
+    def test_daily_mode_continues_after_run_failure(self):
+        import main
+
+        mock_scheduler = MagicMock()
+        mock_scheduler.wait_until_next_run.side_effect = [None, None, KeyboardInterrupt()]
+        mock_scheduler.run_once.side_effect = [RuntimeError("boom"), None]
+
+        with patch("main.SCHEDULER_ENABLED", True), \
+             patch("main.SCHEDULER_MODE", "daily"), \
+             patch("main.SCHEDULE_DAY", 1), \
+             patch("main.SCHEDULE_HOUR", 8), \
+             patch("main.SCHEDULE_MINUTE", 0), \
+             patch("main.Scheduler", return_value=mock_scheduler):
+            with self.assertLogs("main", level="ERROR") as logs:
+                with self.assertRaises(KeyboardInterrupt):
+                    main.main()
+
+        self.assertEqual(mock_scheduler.run_once.call_count, 2)
+        self.assertIn(
+            "Scheduled workflow execution failed; waiting for next run.",
+            "\n".join(logs.output),
+        )
+
+    def test_monthly_mode_continues_after_run_failure(self):
+        import main
+
+        mock_scheduler = MagicMock()
+        mock_scheduler.wait_until_next_run.side_effect = [None, KeyboardInterrupt()]
+        mock_scheduler.run_once.side_effect = RuntimeError("monthly boom")
+
+        with patch("main.SCHEDULER_ENABLED", True), \
+             patch("main.SCHEDULER_MODE", "monthly"), \
+             patch("main.SCHEDULE_DAY", 15), \
+             patch("main.SCHEDULE_HOUR", 3), \
+             patch("main.SCHEDULE_MINUTE", 30), \
+             patch("main.Scheduler", return_value=mock_scheduler):
+            with self.assertLogs("main", level="ERROR") as logs:
+                with self.assertRaises(KeyboardInterrupt):
+                    main.main()
+
+        self.assertEqual(mock_scheduler.run_once.call_count, 1)
+        self.assertIn(
+            "Scheduled workflow execution failed; waiting for next run.",
+            "\n".join(logs.output),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
