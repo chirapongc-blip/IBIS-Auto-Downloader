@@ -621,6 +621,27 @@ class DownloaderEngineTests(unittest.TestCase):
             # Original collision file is untouched.
             self.assertTrue((download_dir / "202605_7001.xlsx").exists())
 
+    def test_chrome_temp_file_is_skipped_until_final_xlsx_appears(self):
+        """_find_new_completed_file must skip .com.google.Chrome.* temp files
+        and return only the final .xlsx file once it appears."""
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            existing_files = engine._snapshot_files()
+
+            chrome_tmp = download_dir / ".com.google.Chrome.AbCdEf"
+            chrome_tmp.write_text("partial", encoding="utf-8")
+
+            # Chrome temp file present but no final file yet — nothing to return.
+            self.assertIsNone(engine._find_new_completed_file(existing_files))
+
+            # Final .xlsx appears after Chrome finishes writing.
+            final_file = download_dir / "invoice.xlsx"
+            final_file.write_text("data", encoding="utf-8")
+
+            # Now the final file should be returned; the Chrome temp file is ignored.
+            self.assertEqual(engine._find_new_completed_file(existing_files), final_file)
+
     def test_crdownload_completion_waits_for_matching_crdownload_to_disappear(self):
         """_find_new_completed_file must skip a completed file while its matching
         .crdownload companion (e.g. invoice.xlsx.crdownload) still exists, and

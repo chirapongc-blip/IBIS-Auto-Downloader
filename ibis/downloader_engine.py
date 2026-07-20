@@ -130,6 +130,11 @@ class DownloaderEngine:
         ):
             if file_path.suffix.lower() in _INCOMPLETE_SUFFIXES:
                 continue
+            # Skip Chrome's internal temporary download files (e.g.
+            # .com.google.Chrome.XXXXXX) — they are renamed to the final file
+            # once the download completes, so we must wait for that final file.
+            if file_path.name.startswith(".com.google.Chrome"):
+                continue
             # Skip if the matching .crdownload companion still exists — the
             # browser hasn't finished writing the file yet.
             if (file_path.parent / (file_path.name + ".crdownload")) in current_files:
