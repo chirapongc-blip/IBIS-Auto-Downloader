@@ -70,7 +70,8 @@ class TestMainFlowIntegration(unittest.TestCase):
              patch("main.DownloadPlan") as MockPlan, \
              patch("main.DownloaderEngine") as MockEngine, \
              patch("main.PeriodTracker") as MockPeriodTracker, \
-             patch("main.DownloadState") as MockDownloadState:
+             patch("main.DownloadState") as MockDownloadState, \
+             patch("main.RunReporter") as MockReporter:
 
             mock_state_manager_instance = MockStateManager.return_value
             mock_plan_instance = MockPlan.return_value
@@ -103,6 +104,7 @@ class TestMainFlowIntegration(unittest.TestCase):
                 "mock_period_tracker_instance": mock_period_tracker_instance,
                 "MockDownloadState": MockDownloadState,
                 "mock_ds_instance": mock_ds_instance,
+                "MockReporter": MockReporter,
             }
 
     def test_queue_is_built_from_scanned_links_and_state_manager(self):
@@ -124,6 +126,16 @@ class TestMainFlowIntegration(unittest.TestCase):
         result["mock_engine_instance"].run.assert_called_once_with(
             result["mock_plan_instance"]
         )
+
+    def test_completed_run_generates_a_report(self):
+        """Reporting is emitted after the workflow has completed successfully."""
+        result = self._run_main(completed=1, queue_size=1)
+        result["MockReporter"].return_value.generate.assert_called_once()
+        _, kwargs = result["MockReporter"].return_value.generate.call_args
+        self.assertEqual(kwargs["invoices_discovered"], 1)
+        self.assertEqual(kwargs["queued"], 1)
+        self.assertEqual(kwargs["completed"], 1)
+        self.assertEqual(kwargs["skipped"], 1)
 
     def test_downloader_engine_instantiated_with_driver(self):
         """DownloaderEngine must be instantiated with the Selenium driver, state manager, and download state."""
