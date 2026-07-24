@@ -1,9 +1,13 @@
+import logging
 import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 from ibis.downloader import get_download_dir, STATUS_PENDING
+
+
+logger = logging.getLogger(__name__)
 
 
 STATUS_DOWNLOADING = "downloading"
@@ -58,9 +62,13 @@ def is_retryable(exc):
 
 
 class DownloaderEngine:
-    def __init__(self, driver, *, download_dir=None, timeout=60, poll_interval=0.2, state_manager=None, download_state=None):
+    def __init__(self, driver, *, download_dir=None, timeout=None, poll_interval=0.2, state_manager=None, download_state=None):
         self.driver = driver
         self.download_dir = Path(download_dir) if download_dir is not None else get_download_dir()
+        if timeout is None:
+            from config import DOWNLOAD_TIMEOUT
+
+            timeout = DOWNLOAD_TIMEOUT
         self.timeout = timeout
         self.poll_interval = poll_interval
         self.state_manager = state_manager
@@ -69,6 +77,13 @@ class DownloaderEngine:
 
     def run(self, plan):
         self.summary = DownloadSummary(total_files=len(plan.scheduled_items))
+        logger.info(
+            "Download plan started: %d item(s), directory=%s, timeout=%ss, poll_interval=%ss.",
+            self.summary.total_files,
+            self.download_dir,
+            self.timeout,
+            self.poll_interval,
+        )
         if self.download_state is not None:
             self.download_state.initialize(plan.scheduled_items)
         started_at = time.monotonic()
@@ -83,7 +98,17 @@ class DownloaderEngine:
         for attempt in range(MAX_RETRIES + 1):
             existing_files = self._snapshot_files()
             try:
+                logger.info(
+                    "Download attempt %d/%d started: invoice_id=%s, billing_period=%s, url=%s, existing_files=%d.",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                    item.invoice_id,
+                    item.billing_period,
+                    item.download_url,
+                    len(existing_files),
+                )
                 self.driver.get(item.download_url)
+                logger.info("Browser navigation completed; waiting for download file.")
                 downloaded_file = self._wait_for_download(existing_files)
 
                 if downloaded_file is None:
@@ -97,6 +122,12 @@ class DownloaderEngine:
 
                 renamed = self._rename_downloaded_file(downloaded_file, item)
                 item.filename = renamed.name
+                logger.info(
+                    "Download completed: invoice_id=%s, file=%s, size=%d bytes.",
+                    item.invoice_id,
+                    renamed,
+                    renamed.stat().st_size,
+                )
                 if self.state_manager is not None:
                     self.state_manager.mark_completed(item)
                 self._finalize_item(item, STATUS_COMPLETED)
@@ -104,21 +135,64 @@ class DownloaderEngine:
 
             except Exception as exc:
                 item.last_error = str(exc)
+                logger.exception(
+                    "Download attempt %d/%d failed: invoice_id=%s, url=%s.",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                    item.invoice_id,
+                    item.download_url,
+                )
                 if not is_retryable(exc) or attempt == MAX_RETRIES:
+                    logger.error(
+                        "Download will not be retried: invoice_id=%s, retryable=%s.",
+                        item.invoice_id,
+                        is_retryable(exc),
+                    )
                     break
                 item.retry_count += 1
+                logger.warning(
+                    "Retrying download: invoice_id=%s, retry_count=%d.",
+                    item.invoice_id,
+                    item.retry_count,
+                )
 
         self._finalize_item(item, STATUS_FAILED)
 
     def _wait_for_download(self, existing_files):
         deadline = time.monotonic() + self.timeout
+        stable_file = None
+        stable_size = None
 
         while time.monotonic() < deadline:
             downloaded_file = self._find_new_completed_file(existing_files)
-            if downloaded_file is not None:
-                return downloaded_file
+            if downloaded_file is None:
+                stable_file = None
+                stable_size = None
+            else:
+                try:
+                    current_size = downloaded_file.stat().st_size
+                except OSError:
+                    logger.debug("Candidate download disappeared before inspection: %s", downloaded_file)
+                    stable_file = None
+                    stable_size = None
+                else:
+                    if downloaded_file == stable_file and current_size == stable_size:
+                        logger.info(
+                            "Download file is stable and accepted: file=%s, size=%d bytes.",
+                            downloaded_file,
+                            current_size,
+                        )
+                        return downloaded_file
+                    stable_file = downloaded_file
+                    stable_size = current_size
+                    logger.info(
+                        "Download candidate found; waiting for size stability: file=%s, size=%d bytes.",
+                        downloaded_file,
+                        current_size,
+                    )
             time.sleep(self.poll_interval)
 
+        logger.warning("Timed out waiting for a stable completed download after %s seconds.", self.timeout)
         return None
 
     def _find_new_completed_file(self, existing_files):
@@ -129,24 +203,33 @@ class DownloaderEngine:
             reverse=True,
         ):
             if file_path.suffix.lower() in _INCOMPLETE_SUFFIXES:
+                logger.debug("Ignoring temporary download file: %s", file_path)
                 continue
             # Skip if the matching .crdownload companion still exists — the
             # browser hasn't finished writing the file yet.
             if (file_path.parent / (file_path.name + ".crdownload")) in current_files:
+                logger.debug("Download candidate still has a .crdownload companion: %s", file_path)
                 continue
             return file_path
         return None
 
-    def _build_target_filename(self, item) -> str | None:
+    def _build_target_filename(self, item, downloaded_file: Path | None = None) -> str | None:
         """Return the desired final filename for *item*, or None to keep the downloaded name."""
+        source_suffix = downloaded_file.suffix.lower() if downloaded_file is not None else ""
+        # IBIS exports its spreadsheet payload as .xls (and may provide .xlsx
+        # in future), so preserve those server-supplied extensions. The legacy
+        # fallback remains only for endpoint/non-export names, where Chrome
+        # did not provide a usable export extension.
+        if source_suffix not in {".xls", ".xlsx"}:
+            source_suffix = ".xlsx"
         pre_set = item.filename
         if pre_set:
             p = Path(pre_set)
             if not p.suffix:
-                return f"{p.stem}.xlsx"
+                return f"{p.stem}{source_suffix}"
             return pre_set
         if item.billing_period and item.invoice_id:
-            return f"{item.billing_period}_{item.invoice_id}.xlsx"
+            return f"{item.billing_period}_{item.invoice_id}{source_suffix}"
         return None
 
     def _rename_downloaded_file(self, downloaded_file: Path, item) -> Path:
@@ -160,15 +243,21 @@ class DownloaderEngine:
         if downloaded_file.suffix.lower() in _INCOMPLETE_SUFFIXES:
             return downloaded_file
 
-        target_name = self._build_target_filename(item)
+        target_name = self._build_target_filename(item, downloaded_file)
         if target_name is None or target_name == downloaded_file.name:
             return downloaded_file
 
         target_path = self._unique_path(downloaded_file.parent / target_name)
         try:
             downloaded_file.rename(target_path)
+            logger.info("Renamed downloaded file: %s -> %s", downloaded_file.name, target_path.name)
             return target_path
         except OSError as exc:
+            logger.exception(
+                "Failed to rename downloaded file '%s' to '%s'; keeping original filename.",
+                downloaded_file.name,
+                target_path.name,
+            )
             warnings.warn(
                 f"Failed to rename '{downloaded_file.name}' to '{target_path.name}': {exc}. "
                 "Keeping original filename.",
