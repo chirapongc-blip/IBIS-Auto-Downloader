@@ -3,10 +3,10 @@ import logging
 import re
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from config import (
     BASE_URL,
-    VERSION,
     SCHEDULER_ENABLED,
     SCHEDULER_MODE,
     SCHEDULE_DAY,
@@ -31,6 +31,7 @@ from ibis.state_manager import StateManager
 from ibis.billing_period import BillingPeriodManager, BillingPeriodNotFoundError
 from ibis.reporting import RunReporter
 from ibis.performance import PerformanceTracker
+from ibis.version import APPLICATION_NAME, __version__
 from logger import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,11 @@ def normalize_billing_periods(value):
     return tuple(dict.fromkeys(parts))
 
 
+def resolve_cli_directory(value):
+    """Return a consistent absolute path without creating it during parsing."""
+    return Path(value).expanduser().resolve()
+
+
 def parse_cli_args(argv=None):
     parser = argparse.ArgumentParser(description="IBIS Auto Downloader")
     parser.add_argument(
@@ -67,6 +73,23 @@ def parse_cli_args(argv=None):
         "--dry-run",
         action="store_true",
         help="Preview the selected download queue without downloading or changing state.",
+    )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print the application version and exit.",
+    )
+    parser.add_argument(
+        "--download-dir",
+        type=resolve_cli_directory,
+        metavar="PATH",
+        help="Override the download directory for this run.",
+    )
+    parser.add_argument(
+        "--report-dir",
+        type=resolve_cli_directory,
+        metavar="PATH",
+        help="Override the report directory for this run.",
     )
     return parser.parse_args([] if argv is None else argv)
 
@@ -240,7 +263,8 @@ def _print_dry_run_preview(plan, selected_periods, found_count, already_complete
     print("=====================================\n")
 
 
-def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=False):
+def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=False,
+                       download_dir=None, report_dir=None):
     """Execute the full Build 2.5 download workflow (one pass).
 
     If ``state/download_state.json`` records an interrupted session the
@@ -274,9 +298,15 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
     workflow_error = None
     failure_stage = "initialization"
 
+    def _create_configured_driver():
+        """Preserve default creation while sharing an optional resolved override."""
+        if download_dir is None:
+            return create_driver()
+        return create_driver(download_dir)
+
     try:
         with performance.stage("browser_startup"):
-            driver = create_driver()
+            driver = _create_configured_driver()
             _initial_driver.append(driver)
         failure_stage = "authentication"
         with performance.stage("authentication"):
@@ -392,7 +422,13 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
         last_engine = [None]
 
         def _engine_factory(d):
-            e = DownloaderEngine(d, state_manager=state_manager, download_state=ds)
+            engine_kwargs = {
+                "state_manager": state_manager,
+                "download_state": ds,
+            }
+            if download_dir is not None:
+                engine_kwargs["download_dir"] = download_dir
+            e = DownloaderEngine(d, **engine_kwargs)
             if resuming:
                 e.preserve_existing_state = True
             if isinstance(e, _DOWNLOADER_ENGINE_TYPE):
@@ -414,7 +450,7 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
         def _driver_factory():
             if _initial_driver:
                 return _initial_driver.pop()
-            return create_driver()
+            return _create_configured_driver()
 
         failure_stage = "download"
         ar = AutoRecovery(
@@ -469,7 +505,8 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
         try:
             with performance.stage("report_generation"):
                 final_state = ds.load_state()
-                report_result = RunReporter().generate(
+                reporter = RunReporter(report_dir) if report_dir is not None else RunReporter()
+                report_result = reporter.generate(
                     run_id or "unknown-run",
                     start_time=started_at,
                     end_time=datetime.now(timezone.utc),
@@ -509,12 +546,16 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
 
 def main(argv=None):
     args = parse_cli_args(argv)
+    if args.version:
+        print(f"{APPLICATION_NAME} {__version__}")
+        return
     run_id = configure_logging()
-    logger.info("Starting IBIS Auto Downloader version %s (run %s).", VERSION, run_id)
+    logger.info("Starting %s version %s (run %s).", APPLICATION_NAME, __version__, run_id)
     if not SCHEDULER_ENABLED:
         # Build 2.6 behaviour: run once and exit.
         scheduler = Scheduler(lambda: _download_workflow(
-            args.billing_period, run_id=run_id, dry_run=args.dry_run
+            args.billing_period, run_id=run_id, dry_run=args.dry_run,
+            download_dir=args.download_dir, report_dir=args.report_dir,
         ))
         scheduler.run_once()
         return
@@ -522,7 +563,8 @@ def main(argv=None):
     # Build 2.7: use configurable schedule.
     scheduler = Scheduler(
         lambda: _download_workflow(
-            args.billing_period, run_id=run_id, dry_run=args.dry_run
+            args.billing_period, run_id=run_id, dry_run=args.dry_run,
+            download_dir=args.download_dir, report_dir=args.report_dir,
         ),
         mode=SCHEDULER_MODE,
         schedule_day=SCHEDULE_DAY,

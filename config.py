@@ -1,6 +1,4 @@
 from pathlib import Path
-
-VERSION = "2.7"
 # Project root
 PROJECT_ROOT = Path(__file__).resolve().parent
 
