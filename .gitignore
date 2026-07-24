@@ -12,6 +12,9 @@ downloads/
 # Runtime logs
 logs/
 
+# Runtime reports
+reports/
+
 # Virtual environments
 .venv/
 venv/

@@ -2,6 +2,7 @@ import argparse
 import logging
 import re
 import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from config import (
     BASE_URL,
@@ -28,9 +29,11 @@ from ibis.period_tracker import PeriodTracker
 from ibis.state import DownloadState
 from ibis.state_manager import StateManager
 from ibis.billing_period import BillingPeriodManager, BillingPeriodNotFoundError
+from ibis.reporting import RunReporter
 from logger import configure_logging
 
 logger = logging.getLogger(__name__)
+_DOWNLOADER_ENGINE_TYPE = DownloaderEngine
 
 _PERIOD_RE = re.compile(r"^\d{6}$")
 
@@ -136,7 +139,64 @@ def _resolve_resume_periods(state, selection):
     return [period for period in available if period in selection]
 
 
-def _download_workflow(billing_period_selection=None):
+def _item_key(item):
+    """Return the stable report identity for a queue/link/state item."""
+    if isinstance(item, dict):
+        invoice_id = item.get("invoice_id")
+        billing_period = item.get("billing_period")
+        if (invoice_id is None or billing_period is None) and item.get("url"):
+            invoice_id, billing_period, _ = extract_link_metadata(item)
+    else:
+        invoice_id = getattr(item, "invoice_id", None)
+        billing_period = getattr(item, "billing_period", None)
+    return invoice_id, billing_period
+
+
+def _report_invoice_details(items, state, skipped_keys, recovered_keys):
+    """Build report records from the final state without changing downloads."""
+    state = state if isinstance(state, dict) else {}
+    completed = {_item_key(item): item for item in state.get("completed", [])}
+    failed = {_item_key(item): item for item in state.get("failed", [])}
+    details = []
+    for item in items:
+        invoice_id, billing_period = _item_key(item)
+        key = invoice_id, billing_period
+        final_item = completed.get(key) or failed.get(key) or item
+        if key in completed:
+            status = "completed"
+        elif key in failed:
+            status = "failed"
+        elif key in skipped_keys:
+            status = "skipped"
+        elif isinstance(final_item, dict):
+            status = final_item.get("download_status", "pending")
+        else:
+            status = getattr(final_item, "download_status", "pending")
+        filename = (
+            final_item.get("filename")
+            if isinstance(final_item, dict)
+            else getattr(final_item, "filename", None)
+        )
+        retry_count = (
+            final_item.get("retry_count", 0)
+            if isinstance(final_item, dict)
+            else getattr(final_item, "retry_count", 0)
+        )
+        details.append(
+            {
+                "billing_period": billing_period,
+                "invoice_id": invoice_id,
+                "filename": filename,
+                "final_status": status,
+                "retry_count": retry_count,
+                "recovered": bool(key in recovered_keys and status == "completed"),
+                "elapsed_seconds": 0.0,
+            }
+        )
+    return details
+
+
+def _download_workflow(billing_period_selection=None, *, run_id=None):
     """Execute the full Build 2.5 download workflow (one pass).
 
     If ``state/download_state.json`` records an interrupted session the
@@ -145,17 +205,33 @@ def _download_workflow(billing_period_selection=None):
     """
 
     logger.info("Starting download workflow.")
+    started_at = datetime.now(timezone.utc)
     ds = DownloadState()
     saved_state = ds.load_state()
     resuming = has_interrupted_session(saved_state)
 
-    driver = create_driver()
+    driver = None
     # _initial_driver is consumed by AutoRecovery on its first run; if an
     # exception occurs before that happens the finally block drains it.
-    _initial_driver = [driver]
+    _initial_driver = []
     state_manager = StateManager()
+    report_items = []
+    skipped_keys = set()
+    recovered_keys = set()
+    selected_periods = []
+    found_count = 0
+    already_completed_count = 0
+    queue = DownloadQueue()
+    engine = None
+    recovery_summary = None
+    ar = None
+    workflow_error = None
+    failure_stage = "initialization"
 
     try:
+        driver = create_driver()
+        _initial_driver.append(driver)
+        failure_stage = "authentication"
         driver.get(BASE_URL)
 
         print("请在浏览器完成登录...")
@@ -164,6 +240,7 @@ def _download_workflow(billing_period_selection=None):
         print("登录成功。")
 
         if resuming:
+            failure_stage = "resume"
             print("Resuming interrupted download session...")
             selected_periods = _resolve_resume_periods(saved_state, billing_period_selection)
             ds.restore(saved_state, selected_periods=selected_periods)
@@ -176,7 +253,12 @@ def _download_workflow(billing_period_selection=None):
                 for item in saved_state.get("queue", [])
                 if item.get("billing_period") in selected_periods
             )
+            report_items = [
+                item for item in saved_state.get("queue", [])
+                if item.get("billing_period") in selected_periods
+            ]
         else:
+            failure_stage = "discovery"
             print("正在打开 Invoice 页面...")
 
             html = open_invoice_page(driver)
@@ -214,8 +296,8 @@ def _download_workflow(billing_period_selection=None):
             selected_periods = _resolve_available_periods(
                 period_manager, billing_period_selection
             )
+            selected_links = _filter_links_for_periods(all_links, selected_periods)
             if len(selected_periods) <= 1:
-                selected_links = _filter_links_for_periods(all_links, selected_periods)
                 queue_result = build_download_queue(
                     selected_links, state_manager=state_manager
                 )
@@ -228,6 +310,10 @@ def _download_workflow(billing_period_selection=None):
             found_count = queue_result.found_count
             already_completed_count = queue_result.already_completed_count
             ds.selected_periods = selected_periods
+            report_items = selected_links
+            skipped_keys = {
+                _item_key(link) for link in selected_links
+            } - {_item_key(item) for item in queue}
 
         print(f"Found invoices: {found_count}")
         print(f"Already completed: {already_completed_count}")
@@ -246,6 +332,17 @@ def _download_workflow(billing_period_selection=None):
             e = DownloaderEngine(d, state_manager=state_manager, download_state=ds)
             if resuming:
                 e.preserve_existing_state = True
+            if isinstance(e, _DOWNLOADER_ENGINE_TYPE):
+                original_run = e.run
+
+                def _tracked_run(recovery_plan):
+                    if getattr(e, "preserve_existing_state", False):
+                        recovered_keys.update(
+                            _item_key(item) for item in recovery_plan.scheduled_items
+                        )
+                    return original_run(recovery_plan)
+
+                e.run = _tracked_run
             last_engine[0] = e
             return e
 
@@ -256,6 +353,7 @@ def _download_workflow(billing_period_selection=None):
                 return _initial_driver.pop()
             return create_driver()
 
+        failure_stage = "download"
         ar = AutoRecovery(
             driver_factory=_driver_factory,
             login_fn=wait_until_logged_in,
@@ -272,6 +370,7 @@ def _download_workflow(billing_period_selection=None):
             print(f"Retry Attempts: {recovery_summary.retry_attempts}")
             print(f"Successful Recoveries: {recovery_summary.successful_recoveries}")
             print(f"Permanent Failures: {recovery_summary.permanent_failures}")
+        failure_stage = None
         if engine is not None and engine.summary.failed == 0 and current_period is not None:
             if len(queue) == 0:
                 if not period_tracker.last_period_file_exists():
@@ -279,11 +378,61 @@ def _download_workflow(billing_period_selection=None):
             elif engine.summary.completed == plan.scheduled_count:
                 period_tracker.save_last_period(current_period)
 
+    except Exception as exc:
+        workflow_error = exc
+        engine = engine or last_engine[0] if "last_engine" in locals() else engine
+        if recovery_summary is None and ar is not None:
+            recovery_summary = getattr(ar, "summary", None)
+        logger.exception("Workflow terminated during %s.", failure_stage)
+        raise
+
     finally:
+        engine_summary = getattr(engine, "summary", None)
+        completed_count = getattr(engine_summary, "completed", 0)
+        failed_count = getattr(engine_summary, "failed", 0)
+        permanent_failure_count = getattr(recovery_summary, "permanent_failures", 0)
+        completed_count = completed_count if isinstance(completed_count, int) else 0
+        failed_count = failed_count if isinstance(failed_count, int) else 0
+        permanent_failure_count = (
+            permanent_failure_count if isinstance(permanent_failure_count, int) else 0
+        )
+        if workflow_error is not None:
+            run_status = "failed"
+        elif failed_count or permanent_failure_count:
+            run_status = "completed_with_failures"
+        else:
+            run_status = "completed"
+        try:
+            final_state = ds.load_state()
+            report_result = RunReporter().generate(
+                run_id or "unknown-run",
+                start_time=started_at,
+                end_time=datetime.now(timezone.utc),
+                selected_billing_periods=selected_periods,
+                invoices_discovered=found_count,
+                queued=len(queue),
+                completed=completed_count,
+                skipped=already_completed_count,
+                retry_attempts=getattr(recovery_summary, "retry_attempts", 0),
+                successful_recoveries=getattr(recovery_summary, "successful_recoveries", 0),
+                permanent_failures=permanent_failure_count,
+                invoices=_report_invoice_details(
+                    report_items, final_state, skipped_keys, recovered_keys
+                ),
+                run_status=run_status,
+                failure_stage=failure_stage if workflow_error is not None else None,
+                error_type=type(workflow_error).__name__ if workflow_error else None,
+                error_message=str(workflow_error) if workflow_error else None,
+            )
+            logger.info("Run report generated: %s", report_result["json"])
+        except Exception:
+            logger.exception("Run report generation failed.")
+            if workflow_error is None:
+                raise
         # AutoRecovery quits its own driver when run() returns or raises.
         # Only quit here if AutoRecovery never consumed the initial driver
         # (i.e. an exception occurred before ar.run() was reached).
-        if _initial_driver:
+        if _initial_driver and driver is not None:
             driver.quit()
 
 
@@ -293,13 +442,13 @@ def main(argv=None):
     logger.info("Starting IBIS Auto Downloader version %s (run %s).", VERSION, run_id)
     if not SCHEDULER_ENABLED:
         # Build 2.6 behaviour: run once and exit.
-        scheduler = Scheduler(lambda: _download_workflow(args.billing_period))
+        scheduler = Scheduler(lambda: _download_workflow(args.billing_period, run_id=run_id))
         scheduler.run_once()
         return
 
     # Build 2.7: use configurable schedule.
     scheduler = Scheduler(
-        lambda: _download_workflow(args.billing_period),
+        lambda: _download_workflow(args.billing_period, run_id=run_id),
         mode=SCHEDULER_MODE,
         schedule_day=SCHEDULE_DAY,
         schedule_hour=SCHEDULE_HOUR,
