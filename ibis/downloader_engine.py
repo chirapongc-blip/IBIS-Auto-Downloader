@@ -286,11 +286,21 @@ class DownloaderEngine:
 
     def _find_new_completed_file(self, existing_files):
         current_files = self._snapshot_files()
-        for file_path in sorted(
-            current_files - existing_files,
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        ):
+        candidates = []
+        for file_path in current_files - existing_files:
+            try:
+                candidates.append((file_path.stat().st_mtime, file_path))
+            except FileNotFoundError:
+                # Chrome can atomically rename/remove its .crdownload file
+                # between directory enumeration and stat().  This is a normal
+                # download-completion race, not a permanent download failure.
+                logger.debug("Temporary download file disappeared during inspection: %s", file_path)
+                continue
+            except OSError:
+                logger.debug("Could not inspect download candidate; continuing to poll: %s", file_path)
+                continue
+
+        for _, file_path in sorted(candidates, reverse=True):
             if file_path.suffix.lower() in _INCOMPLETE_SUFFIXES:
                 logger.debug("Ignoring temporary download file: %s", file_path)
                 continue
