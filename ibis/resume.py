@@ -46,7 +46,7 @@ def has_interrupted_session(state: dict) -> bool:
     return len(completed) < len(queue)
 
 
-def build_resume_queue(state: dict) -> DownloadQueue:
+def build_resume_queue(state: dict, *, periods=None) -> DownloadQueue:
     """Return a :class:`DownloadQueue` with only the pending and failed items.
 
     Items already present in the ``completed`` list of *state* are skipped.
@@ -61,6 +61,8 @@ def build_resume_queue(state: dict) -> DownloadQueue:
     state : dict
         The plain-dict payload returned by :meth:`DownloadState.load_state`.
     """
+    selected_periods = periods if periods is not None else state.get("selected_periods")
+    allowed_periods = set(selected_periods) if selected_periods is not None else None
     queue_items = state.get("queue", [])
     completed = state.get("completed", [])
 
@@ -68,6 +70,8 @@ def build_resume_queue(state: dict) -> DownloadQueue:
 
     links = []
     for item in queue_items:
+        if allowed_periods is not None and item.get("billing_period") not in allowed_periods:
+            continue
         completed_entry = completed_entries.get(
             (item.get("invoice_id"), item.get("billing_period"))
         )

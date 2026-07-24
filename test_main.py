@@ -298,7 +298,9 @@ class TestMainResumeIntegration(unittest.TestCase):
         """build_resume_queue must be called with the loaded state dict."""
         saved_state = self._make_interrupted_state()
         result = self._run_main_with_resume(saved_state)
-        result["mock_build_resume"].assert_called_once_with(saved_state)
+        result["mock_build_resume"].assert_called_once_with(
+            saved_state, periods=["202605"]
+        )
 
     def test_resume_passes_download_state_to_engine(self):
         """DownloaderEngine must receive the DownloadState instance during resume."""

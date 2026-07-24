@@ -174,7 +174,7 @@ class TestDownloadPlanDuplicateInvoices(unittest.TestCase):
 
 
 class TestDownloadPlanDuplicatesAcrossAllPeriods(unittest.TestCase):
-    """With latest_only=False duplicates are resolved across all periods."""
+    """The same invoice ID remains distinct across billing periods."""
 
     def setUp(self):
         self.queue = _make_queue(
@@ -188,10 +188,10 @@ class TestDownloadPlanDuplicatesAcrossAllPeriods(unittest.TestCase):
         self.assertEqual(self.plan.total_queue_items, 3)
 
     def test_duplicates_removed(self):
-        self.assertEqual(self.plan.duplicates_removed, 1)
+        self.assertEqual(self.plan.duplicates_removed, 0)
 
     def test_scheduled_count(self):
-        self.assertEqual(self.plan.scheduled_count, 2)
+        self.assertEqual(self.plan.scheduled_count, 3)
 
 
 class TestDownloadPlanSummaryStatistics(unittest.TestCase):

@@ -91,16 +91,18 @@ class DownloadPlan:
         else:
             candidate_items = all_items
 
-        # Deduplicate by invoice_id (keep first occurrence; None ids are kept)
-        seen_ids: set[str] = set()
+        # An invoice ID is only unique within a billing period.  Keep entries
+        # for the same invoice ID when they belong to different periods.
+        seen_keys: set[tuple[str, str | None]] = set()
         scheduled = []
         duplicates = 0
         for item in candidate_items:
             if item.invoice_id is not None:
-                if item.invoice_id in seen_ids:
+                key = (item.invoice_id, item.billing_period)
+                if key in seen_keys:
                     duplicates += 1
                     continue
-                seen_ids.add(item.invoice_id)
+                seen_keys.add(key)
             scheduled.append(item)
 
         self._scheduled_items = scheduled

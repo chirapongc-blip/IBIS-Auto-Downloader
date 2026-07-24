@@ -29,11 +29,12 @@ class BillingPeriodManager:
     change the page or trigger downloads.
     """
 
-    def __init__(self, driver, *, base_url: str = BASE_URL):
+    def __init__(self, driver, *, base_url: str = BASE_URL, links=None):
         self.driver = driver
         self.base_url = base_url
         self.selected_period: str | None = None
         self._periods: list[str] | None = None
+        self._links = links
 
     def get_periods(self, *, refresh: bool = False) -> list[str]:
         """Return all available billing periods, newest first.
@@ -42,7 +43,9 @@ class BillingPeriodManager:
         Pass ``refresh=True`` to discard the cached snapshot and rediscover.
         """
         if self._periods is None or refresh:
-            links = collect_grid_download_links(self.driver, self.base_url)
+            links = self._links
+            if links is None:
+                links = collect_grid_download_links(self.driver, self.base_url)
             periods = {
                 str(billing_period)
                 for link in links

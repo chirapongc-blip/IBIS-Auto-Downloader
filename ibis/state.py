@@ -33,11 +33,13 @@ class DownloadState:
         billing_period=None,
         invoice_id=None,
         customer_id=None,
+        selected_periods=None,
     ):
         self.state_file = Path(state_file) if state_file is not None else _DEFAULT_STATE_FILE
         self.billing_period = billing_period
         self.invoice_id = invoice_id
         self.customer_id = customer_id
+        self.selected_periods = list(selected_periods) if selected_periods is not None else None
         self._queue: list = []
         self._completed: list = []
         self._failed: list = []
@@ -59,6 +61,35 @@ class DownloadState:
         self._completed = []
         self._failed = []
         self.save_state()
+
+    def restore(self, state: dict, *, selected_periods=None):
+        """Restore a persisted session into memory for period-scoped resume.
+
+        Legacy snapshots without ``selected_periods`` remain supported.  When
+        a selection is supplied, unrelated periods are excluded from the
+        in-memory session before it is saved again.
+        """
+        periods = selected_periods
+        if periods is None:
+            periods = state.get("selected_periods")
+        self.selected_periods = list(periods) if periods is not None else None
+        allowed = (
+            set(self.selected_periods)
+            if self.selected_periods is not None
+            else None
+        )
+
+        def keep(items):
+            if allowed is None:
+                return list(items)
+            return [item for item in items if item.get("billing_period") in allowed]
+
+        self.billing_period = state.get("billing_period")
+        self.customer_id = state.get("customer_id")
+        self.invoice_id = state.get("invoice_id")
+        self._queue = keep(state.get("queue", []))
+        self._completed = keep(state.get("completed", []))
+        self._failed = keep(state.get("failed", []))
 
     def mark_completed(self, item):
         """Record *item* as completed and reconcile prior in-session status."""
@@ -94,6 +125,7 @@ class DownloadState:
             "billing_period": self.billing_period,
             "customer_id": self.customer_id,
             "invoice_id": self.invoice_id,
+            "selected_periods": self.selected_periods,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "queue": [self._serialize_item(item) for item in self._queue],
             "completed": [self._serialize_item(item) for item in self._completed],
