@@ -5,6 +5,7 @@ from urllib.parse import parse_qsl, urlparse
 
 DOWNLOAD_DIR = Path("downloads")
 STATUS_PENDING = "pending"
+_INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp")
 
 
 @dataclass
@@ -79,6 +80,39 @@ def get_download_dir():
     from config import DOWNLOAD_DIR
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     return DOWNLOAD_DIR
+
+
+def find_downloaded_output(filename, *, download_dir=None):
+    """Return the on-disk output for *filename*, or ``None`` when absent.
+
+    Older state records commonly stored the business filename without its
+    extension.  In that case, look for a completed file sharing that stem,
+    while deliberately ignoring browser temporary files.
+    """
+    if not filename:
+        return None
+
+    directory = Path(download_dir) if download_dir is not None else get_download_dir()
+    name = Path(filename).name
+    if name != filename:
+        return None
+
+    exact_path = directory / name
+    if exact_path.is_file():
+        return exact_path
+    if Path(name).suffix:
+        return None
+
+    candidates = sorted(
+        (
+            path
+            for path in directory.glob(f"{name}.*")
+            if path.is_file() and path.suffix.lower() not in _INCOMPLETE_SUFFIXES
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
 
 
 def _parse_download_params(url: str):
