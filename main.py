@@ -23,6 +23,7 @@ from ibis.scheduler import DownloadPlan, Scheduler
 from ibis.period_tracker import PeriodTracker
 from ibis.state import DownloadState
 from ibis.state_manager import StateManager
+from logger import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ def _download_workflow():
     and the grid-scanning step is skipped.  All other behaviour is preserved.
     """
 
+    logger.info("Starting download workflow.")
     ds = DownloadState()
     saved_state = ds.load_state()
     resuming = has_interrupted_session(saved_state)
@@ -150,6 +152,8 @@ def _download_workflow():
 
 
 def main():
+    run_id = configure_logging()
+    logger.info("Starting IBIS Auto Downloader version %s (run %s).", VERSION, run_id)
     if not SCHEDULER_ENABLED:
         # Build 2.6 behaviour: run once and exit.
         scheduler = Scheduler(_download_workflow)
