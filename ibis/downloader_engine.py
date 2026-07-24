@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ibis.downloader import get_download_dir, STATUS_PENDING
+from ibis.retry import ErrorCategory, backoff_seconds, classify_error
 
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,8 @@ class DownloadSummary:
     completed: int = 0
     failed: int = 0
     retried: int = 0
+    retry_attempts: int = 0
+    permanent_failures: int = 0
     skipped: int = 0
 
 
@@ -58,11 +61,11 @@ class DuplicateFileError(DownloadError):
 
 def is_retryable(exc):
     """Return True if *exc* represents a transient failure that warrants a retry."""
-    return isinstance(exc, (DownloadTimeoutError, IncompleteDownloadError, TemporaryBrowserError))
+    return classify_error(exc) is ErrorCategory.TEMPORARY
 
 
 class DownloaderEngine:
-    def __init__(self, driver, *, download_dir=None, timeout=None, poll_interval=0.2, state_manager=None, download_state=None):
+    def __init__(self, driver, *, download_dir=None, timeout=None, poll_interval=0.2, state_manager=None, download_state=None, sleep_fn=None):
         self.driver = driver
         self.download_dir = Path(download_dir) if download_dir is not None else get_download_dir()
         if timeout is None:
@@ -73,6 +76,7 @@ class DownloaderEngine:
         self.poll_interval = poll_interval
         self.state_manager = state_manager
         self.download_state = download_state
+        self.sleep_fn = sleep_fn or time.sleep
         self.summary = DownloadSummary()
 
     def run(self, plan):
@@ -135,26 +139,38 @@ class DownloaderEngine:
 
             except Exception as exc:
                 item.last_error = str(exc)
+                category = classify_error(exc)
                 logger.exception(
-                    "Download attempt %d/%d failed: invoice_id=%s, url=%s.",
+                    "Download attempt %d/%d failed: invoice_id=%s, category=%s, url=%s.",
                     attempt + 1,
                     MAX_RETRIES + 1,
                     item.invoice_id,
+                    category.value,
                     item.download_url,
                 )
-                if not is_retryable(exc) or attempt == MAX_RETRIES:
-                    logger.error(
-                        "Download will not be retried: invoice_id=%s, retryable=%s.",
+                if category is ErrorCategory.SESSION:
+                    logger.warning(
+                        "Session failure delegated to AutoRecovery: invoice_id=%s.",
                         item.invoice_id,
-                        is_retryable(exc),
                     )
+                    raise
+                if category is ErrorCategory.PERMANENT:
+                    self.summary.permanent_failures += 1
+                    logger.error("Permanent download failure: invoice_id=%s.", item.invoice_id)
+                    break
+                if attempt == MAX_RETRIES:
+                    logger.error("Temporary retries exhausted: invoice_id=%s.", item.invoice_id)
                     break
                 item.retry_count += 1
+                self.summary.retry_attempts += 1
+                delay = backoff_seconds(item.retry_count)
                 logger.warning(
-                    "Retrying download: invoice_id=%s, retry_count=%d.",
+                    "Retrying download: invoice_id=%s, retry_count=%d, backoff=%ss.",
                     item.invoice_id,
                     item.retry_count,
+                    delay,
                 )
+                self.sleep_fn(delay)
 
         self._finalize_item(item, STATUS_FAILED)
 
@@ -190,7 +206,7 @@ class DownloaderEngine:
                         downloaded_file,
                         current_size,
                     )
-            time.sleep(self.poll_interval)
+            self.sleep_fn(self.poll_interval)
 
         logger.warning("Timed out waiting for a stable completed download after %s seconds.", self.timeout)
         return None
@@ -316,5 +332,7 @@ class DownloaderEngine:
         print(f"Completed: {self.summary.completed}")
         print(f"Failed: {self.summary.failed}")
         print(f"Retried: {self.summary.retried}")
+        print(f"Retry Attempts: {self.summary.retry_attempts}")
+        print(f"Permanent Failures: {self.summary.permanent_failures}")
         print(f"Skipped: {self.summary.skipped}")
         print(f"Elapsed: {elapsed_seconds:.1f} s")

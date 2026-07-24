@@ -442,6 +442,7 @@ class DownloaderEngineTests(unittest.TestCase):
                     completed=2,
                     failed=1,
                     retried=2,
+                    retry_attempts=5,
                     skipped=0,
                 ),
             )
@@ -509,7 +510,7 @@ class DownloaderEngineTests(unittest.TestCase):
             )
             self.assertEqual(len(progress_lines), 2)
             self.assertEqual(
-                printed_lines[-8:-1],
+                printed_lines[-10:-1],
                 [
                     "Download Summary",
                     "----------------",
@@ -517,6 +518,8 @@ class DownloaderEngineTests(unittest.TestCase):
                     "Completed: 1",
                     "Failed: 1",
                     "Retried: 0",
+                    "Retry Attempts: 0",
+                    "Permanent Failures: 1",
                     "Skipped: 0",
                 ],
             )

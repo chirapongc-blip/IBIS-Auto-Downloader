@@ -20,7 +20,8 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from ibis.recovery import CrashRecoveryHandler, is_browser_failure
+from ibis.recovery import CrashRecoveryHandler
+from ibis.retry import ErrorCategory, classify_error
 from ibis.resume import build_resume_queue, has_interrupted_session
 from ibis.scheduler import DownloadPlan
 
@@ -28,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 # Maximum number of automatic recovery attempts per session.
 MAX_RECOVERY_ATTEMPTS = 3
+
+
+class RecoverySummary:
+    """Aggregate retry and recovery outcomes for one application run."""
+
+    def __init__(self) -> None:
+        self.retry_attempts = 0
+        self.successful_recoveries = 0
+        self.permanent_failures = 0
 
 
 class AutoRecovery:
@@ -80,6 +90,7 @@ class AutoRecovery:
         self.recovery_handler = recovery_handler or CrashRecoveryHandler(
             download_state=download_state
         )
+        self.summary = RecoverySummary()
 
     # ------------------------------------------------------------------
     # Public API
@@ -101,19 +112,23 @@ class AutoRecovery:
         driver = self.driver_factory()
         current_plan = plan
         attempt = 0
+        self.summary = RecoverySummary()
 
         while True:
             try:
                 engine = self.engine_factory(driver)
                 engine.run(current_plan)
+                self._record_engine_summary(engine)
                 # Successful completion – quit driver and return.
                 self._quit_driver(driver)
-                return
+                return self.summary
 
             except Exception as exc:
-                if not is_browser_failure(exc):
+                if classify_error(exc) is not ErrorCategory.SESSION:
                     self._quit_driver(driver)
                     raise
+
+                self._record_engine_summary(engine)
 
                 attempt += 1
                 logger.warning(
@@ -138,6 +153,11 @@ class AutoRecovery:
                 # Attempt recovery: new driver → login → invoice page → resume.
                 driver = self._recover(driver)
                 current_plan = self._rebuild_plan()
+                self.summary.successful_recoveries += 1
+                logger.info(
+                    "Automatic recovery succeeded: count=%d.",
+                    self.summary.successful_recoveries,
+                )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -175,6 +195,12 @@ class AutoRecovery:
         queue = build_resume_queue(saved_state)
         logger.info("Rebuilt resume queue with %d item(s).", len(queue))
         return DownloadPlan(queue, latest_only=False)
+
+    def _record_engine_summary(self, engine) -> None:
+        """Accumulate metrics from an engine run, including aborted runs."""
+        engine_summary = getattr(engine, "summary", None)
+        self.summary.retry_attempts += getattr(engine_summary, "retry_attempts", 0)
+        self.summary.permanent_failures += getattr(engine_summary, "permanent_failures", 0)
 
     @staticmethod
     def _quit_driver(driver) -> None:
