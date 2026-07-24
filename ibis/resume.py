@@ -12,7 +12,12 @@ The logic here intentionally lives *outside* ``DownloadState`` so that
 the two concerns stay separate.
 """
 
-from ibis.downloader import DownloadQueue
+import logging
+
+from ibis.downloader import DownloadQueue, find_downloaded_output
+
+
+logger = logging.getLogger(__name__)
 
 
 def has_interrupted_session(state: dict) -> bool:
@@ -59,12 +64,35 @@ def build_resume_queue(state: dict) -> DownloadQueue:
     queue_items = state.get("queue", [])
     completed = state.get("completed", [])
 
-    completed_keys = _build_completed_keys(completed)
+    completed_entries = _build_completed_entries(completed)
 
     links = []
     for item in queue_items:
-        if _is_completed(item, completed_keys):
-            continue
+        completed_entry = completed_entries.get(
+            (item.get("invoice_id"), item.get("billing_period"))
+        )
+        if completed_entry is not None:
+            recorded_filename = completed_entry.get("filename") or item.get("filename")
+            if recorded_filename is None:
+                # Preserve support for pre-Sprint-2 state snapshots. Newer
+                # records always have a filename and are verified below.
+                continue
+            output_file = find_downloaded_output(recorded_filename)
+            expected_size = completed_entry.get("filesize")
+            if output_file is None:
+                logger.warning(
+                    "Resuming invoice %s because recorded output '%s' is missing.",
+                    item.get("invoice_id"),
+                    recorded_filename,
+                )
+            elif expected_size is not None and output_file.stat().st_size != expected_size:
+                logger.warning(
+                    "Resuming invoice %s because output '%s' size changed.",
+                    item.get("invoice_id"),
+                    output_file.name,
+                )
+            else:
+                continue
         url = item.get("download_url", "")
         if not url:
             continue
@@ -97,6 +125,15 @@ def _build_completed_keys(completed: list) -> set:
         if invoice_id is not None:
             keys.add((invoice_id, item.get("billing_period")))
     return keys
+
+
+def _build_completed_entries(completed: list) -> dict:
+    """Index completed state entries by invoice ID and billing period."""
+    return {
+        (item.get("invoice_id"), item.get("billing_period")): item
+        for item in completed
+        if item.get("invoice_id") is not None
+    }
 
 
 def _is_completed(item: dict, completed_keys: set) -> bool:
