@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import warnings
 from dataclasses import dataclass
@@ -9,11 +10,21 @@ from ibis.retry import (
     ErrorCategory,
     backoff_seconds,
     classify_error,
+    register_session_error_types,
     register_temporary_error_types,
 )
 
 
 logger = logging.getLogger(__name__)
+
+try:  # Selenium is optional for lightweight unit-test environments.
+    from selenium.common.exceptions import InvalidSessionIdException
+except ImportError:  # pragma: no cover - production installs Selenium
+    class InvalidSessionIdException(Exception):
+        """Fallback used only when Selenium is unavailable."""
+
+
+register_session_error_types(InvalidSessionIdException)
 
 
 STATUS_DOWNLOADING = "downloading"
@@ -23,6 +34,50 @@ STATUS_SKIPPED = "skipped"
 _INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp")
 
 MAX_RETRIES = 3
+_FORCED_SESSION_FAILURE_ENV = "IBIS_TEST_FORCE_SESSION_FAILURE_AFTER"
+
+
+class ControlledSessionFailureInjector:
+    """Development-only, one-shot session-failure hook for live validation.
+
+    This is intentionally enabled only by the private environment variable
+    ``IBIS_TEST_FORCE_SESSION_FAILURE_AFTER``.  It is not an application
+    setting and must never be used as part of normal production operation.
+    """
+
+    def __init__(self, after_completed: int | None = None):
+        self.after_completed = after_completed
+        self.triggered = False
+
+    @classmethod
+    def from_environment(cls, environ=None):
+        """Create a disabled injector unless the environment contains a positive integer."""
+        environ = os.environ if environ is None else environ
+        raw_value = environ.get(_FORCED_SESSION_FAILURE_ENV)
+        try:
+            after_completed = int(raw_value) if raw_value is not None else None
+        except (TypeError, ValueError):
+            after_completed = None
+        if after_completed is not None and after_completed < 1:
+            after_completed = None
+        return cls(after_completed)
+
+    @property
+    def enabled(self) -> bool:
+        return self.after_completed is not None
+
+    def raise_if_due(self, completed_count: int) -> None:
+        """Raise one real Selenium session exception when the configured point is reached."""
+        if not self.enabled or self.triggered or completed_count < self.after_completed:
+            return
+        self.triggered = True
+        logger.warning(
+            "TEST ONLY: injecting Selenium session failure after %d completed invoice.",
+            completed_count,
+        )
+        raise InvalidSessionIdException(
+            "Controlled validation fault: simulated Selenium session failure"
+        )
 
 
 @dataclass
@@ -77,7 +132,7 @@ def is_retryable(exc):
 
 
 class DownloaderEngine:
-    def __init__(self, driver, *, download_dir=None, timeout=None, poll_interval=0.2, state_manager=None, download_state=None, sleep_fn=None):
+    def __init__(self, driver, *, download_dir=None, timeout=None, poll_interval=0.2, state_manager=None, download_state=None, sleep_fn=None, fault_injector=None):
         self.driver = driver
         self.download_dir = Path(download_dir) if download_dir is not None else get_download_dir()
         if timeout is None:
@@ -89,6 +144,9 @@ class DownloaderEngine:
         self.state_manager = state_manager
         self.download_state = download_state
         self.sleep_fn = sleep_fn or time.sleep
+        # Controlled validation only.  AutoRecovery shares this one object
+        # with recovered engines so a single application run injects once.
+        self.fault_injector = fault_injector or ControlledSessionFailureInjector.from_environment()
         self.summary = DownloadSummary()
 
     def run(self, plan):
@@ -125,6 +183,7 @@ class DownloaderEngine:
                     item.download_url,
                     len(existing_files),
                 )
+                self.fault_injector.raise_if_due(self.summary.completed)
                 self.driver.get(item.download_url)
                 logger.info("Browser navigation completed; waiting for download file.")
                 downloaded_file = self._wait_for_download(existing_files)

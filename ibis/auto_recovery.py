@@ -25,6 +25,7 @@ from ibis.recovery import CrashRecoveryHandler
 from ibis.retry import ErrorCategory, classify_error
 from ibis.resume import build_resume_queue, has_interrupted_session
 from ibis.scheduler import DownloadPlan
+from ibis.downloader_engine import DownloaderEngine
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ class AutoRecovery:
             download_state=download_state
         )
         self.summary = RecoverySummary()
+        self._fault_injector = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -121,6 +123,7 @@ class AutoRecovery:
             engine = None
             try:
                 engine = self.engine_factory(driver)
+                self._share_fault_injector(engine)
                 if recovered_workflow_pending:
                     # Keep the original DownloadState queue and completed
                     # history intact while the remaining plan is processed.
@@ -234,6 +237,15 @@ class AutoRecovery:
         self.summary.permanent_failures += (
             permanent_failures if isinstance(permanent_failures, int) else 0
         )
+
+    def _share_fault_injector(self, engine) -> None:
+        """Keep the development-only injector one-shot across recovery engines."""
+        if not isinstance(engine, DownloaderEngine):
+            return
+        if self._fault_injector is None:
+            self._fault_injector = engine.fault_injector
+        else:
+            engine.fault_injector = self._fault_injector
 
     def _log_final_summary(self) -> None:
         logger.error(

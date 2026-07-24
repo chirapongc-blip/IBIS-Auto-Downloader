@@ -31,6 +31,12 @@ except ImportError:  # pragma: no cover - exercised only without Selenium
 _TEMPORARY_ERROR_TYPES: tuple[type[BaseException], ...] = ()
 
 
+def register_session_error_types(*error_types: type[BaseException]) -> None:
+    """Register explicit session exception classes without message matching."""
+    global _SESSION_ERROR_TYPES
+    _SESSION_ERROR_TYPES = tuple(dict.fromkeys((*_SESSION_ERROR_TYPES, *error_types)))
+
+
 def register_temporary_error_types(*error_types: type[BaseException]) -> None:
     """Register downloader-owned temporary exception classes.
 
