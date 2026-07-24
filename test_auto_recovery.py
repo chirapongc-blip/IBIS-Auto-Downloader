@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, call, patch
 
+from selenium.common.exceptions import WebDriverException
 from ibis.auto_recovery import AutoRecovery, MAX_RECOVERY_ATTEMPTS
 from ibis.downloader import DownloadQueue, DownloadQueueItem, STATUS_PENDING
 from ibis.recovery import CrashRecoveryHandler
@@ -16,11 +17,7 @@ from ibis.state import DownloadState
 # Helpers / Stubs
 # ---------------------------------------------------------------------------
 
-class _FakeWebDriverException(Exception):
-    """Simulates a WebDriverException by name (Selenium not required)."""
-
-
-_FakeWebDriverException.__name__ = "WebDriverException"
+_FakeWebDriverException = WebDriverException
 
 
 def _make_item(invoice_id="INV001", billing_period="202605"):

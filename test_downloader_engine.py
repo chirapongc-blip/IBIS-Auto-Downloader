@@ -23,6 +23,19 @@ from ibis.downloader_engine import (
 from ibis.scheduler import DownloadPlan
 
 
+_sleep_patcher = None
+
+
+def setUpModule():
+    global _sleep_patcher
+    _sleep_patcher = patch("ibis.downloader_engine.time.sleep", return_value=None)
+    _sleep_patcher.start()
+
+
+def tearDownModule():
+    _sleep_patcher.stop()
+
+
 class FakeDriver:
     def __init__(self, download_dir: Path, file_by_url=None):
         self.download_dir = download_dir
@@ -442,6 +455,7 @@ class DownloaderEngineTests(unittest.TestCase):
                     completed=2,
                     failed=1,
                     retried=2,
+                    retry_attempts=5,
                     skipped=0,
                 ),
             )
@@ -509,7 +523,7 @@ class DownloaderEngineTests(unittest.TestCase):
             )
             self.assertEqual(len(progress_lines), 2)
             self.assertEqual(
-                printed_lines[-8:-1],
+                printed_lines[-10:-1],
                 [
                     "Download Summary",
                     "----------------",
@@ -517,6 +531,8 @@ class DownloaderEngineTests(unittest.TestCase):
                     "Completed: 1",
                     "Failed: 1",
                     "Retried: 0",
+                    "Retry Attempts: 0",
+                    "Permanent Failures: 1",
                     "Skipped: 0",
                 ],
             )
@@ -641,6 +657,54 @@ class DownloaderEngineTests(unittest.TestCase):
             # Companion removed — download is complete.
             crdownload.unlink()
             self.assertEqual(engine._find_new_completed_file(existing_files), final_file)
+
+    def test_disappearing_crdownload_during_stat_is_ignored_as_download_race(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            engine = DownloaderEngine(driver=None, download_dir=download_dir)
+            existing_files = engine._snapshot_files()
+
+            final_file = download_dir / "invoice.xls"
+            vanished_temp = download_dir / "stale.crdownload"
+            final_file.write_text("data", encoding="utf-8")
+            vanished_temp.write_text("partial", encoding="utf-8")
+            vanished_temp.unlink()
+
+            with patch.object(
+                engine,
+                "_snapshot_files",
+                return_value={final_file, vanished_temp},
+            ):
+                self.assertEqual(engine._find_new_completed_file(existing_files), final_file)
+
+    def test_disappearing_temporary_download_uses_temporary_retry_not_permanent_failure(self):
+        class VanishingDownloadDriver:
+            def __init__(self, directory):
+                self.directory = directory
+                self.calls = 0
+
+            def get(self, _url):
+                self.calls += 1
+                temporary = self.directory / f"attempt-{self.calls}.crdownload"
+                temporary.write_text("partial", encoding="utf-8")
+                temporary.unlink()
+
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            url = "https://example.com/DownloadARExport.aspx?InvoiceID=RACE1&BillingPeriod=202605"
+            queue = DownloadQueue.from_links([{"url": url}])
+            engine = DownloaderEngine(
+                VanishingDownloadDriver(download_dir),
+                download_dir=download_dir,
+                timeout=0.001,
+                poll_interval=0,
+                sleep_fn=lambda _delay: None,
+            )
+            engine.run(DownloadPlan(queue))
+
+        self.assertEqual(engine.summary.retry_attempts, MAX_RETRIES)
+        self.assertEqual(engine.summary.permanent_failures, 0)
+        self.assertEqual(engine.summary.failed, 1)
 
     def test_crdownload_file_is_not_renamed(self):
         """A file with a .crdownload suffix must never be renamed."""

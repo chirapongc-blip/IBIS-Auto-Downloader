@@ -61,13 +61,27 @@ class DownloadState:
         self.save_state()
 
     def mark_completed(self, item):
-        """Record *item* as successfully completed and persist state."""
-        self._completed.append(item)
+        """Record *item* as completed and reconcile prior in-session status."""
+        completed_item = self._sync_queue_item(item)
+        key = self._item_key(completed_item)
+        if key is not None:
+            self._failed = [entry for entry in self._failed if self._item_key(entry) != key]
+            self._completed = [
+                entry for entry in self._completed if self._item_key(entry) != key
+            ]
+        self._completed.append(completed_item)
         self.save_state()
 
     def mark_failed(self, item):
         """Record *item* as failed and persist state."""
-        self._failed.append(item)
+        failed_item = self._sync_queue_item(item)
+        key = self._item_key(failed_item)
+        if key is not None:
+            self._completed = [
+                entry for entry in self._completed if self._item_key(entry) != key
+            ]
+            self._failed = [entry for entry in self._failed if self._item_key(entry) != key]
+        self._failed.append(failed_item)
         self.save_state()
 
     def save_state(self):
@@ -108,6 +122,47 @@ class DownloadState:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _item_key(item):
+        """Return the stable state key for an item, or ``None`` when unavailable."""
+        if isinstance(item, dict):
+            key = item.get("invoice_id"), item.get("billing_period")
+        else:
+            key = getattr(item, "invoice_id", None), getattr(item, "billing_period", None)
+        return key if key != (None, None) else None
+
+    @staticmethod
+    def _copy_item_state(target, source):
+        """Update a queued entry with the latest terminal state from *source*."""
+        fields = (
+            "download_status",
+            "filename",
+            "last_error",
+            "retry_count",
+        )
+        for field in fields:
+            value = source.get(field) if isinstance(source, dict) else getattr(source, field, None)
+            if isinstance(target, dict):
+                target[field] = value
+            else:
+                setattr(target, field, value)
+
+    def _sync_queue_item(self, item):
+        """Return the canonical queued item after copying the latest item state.
+
+        Recovery creates new queue-item objects.  Updating the original queue
+        entry keeps the persisted full-session queue consistent with the
+        recovered terminal result.
+        """
+        key = self._item_key(item)
+        if key is None:
+            return item
+        for queued_item in self._queue:
+            if self._item_key(queued_item) == key:
+                self._copy_item_state(queued_item, item)
+                return queued_item
+        return item
 
     @staticmethod
     def _serialize_item(item) -> dict:

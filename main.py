@@ -133,9 +133,15 @@ def _download_workflow():
             download_state=ds,
             engine_factory=_engine_factory,
         )
-        ar.run(plan)
+        recovery_summary = ar.run(plan)
 
         engine = last_engine[0]
+        if recovery_summary is not None:
+            print("Retry and Recovery Summary")
+            print("--------------------------")
+            print(f"Retry Attempts: {recovery_summary.retry_attempts}")
+            print(f"Successful Recoveries: {recovery_summary.successful_recoveries}")
+            print(f"Permanent Failures: {recovery_summary.permanent_failures}")
         if engine is not None and engine.summary.failed == 0 and current_period is not None:
             if len(queue) == 0:
                 if not period_tracker.last_period_file_exists():

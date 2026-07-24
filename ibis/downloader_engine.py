@@ -1,13 +1,30 @@
 import logging
+import os
 import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 from ibis.downloader import get_download_dir, STATUS_PENDING
+from ibis.retry import (
+    ErrorCategory,
+    backoff_seconds,
+    classify_error,
+    register_session_error_types,
+    register_temporary_error_types,
+)
 
 
 logger = logging.getLogger(__name__)
+
+try:  # Selenium is optional for lightweight unit-test environments.
+    from selenium.common.exceptions import InvalidSessionIdException
+except ImportError:  # pragma: no cover - production installs Selenium
+    class InvalidSessionIdException(Exception):
+        """Fallback used only when Selenium is unavailable."""
+
+
+register_session_error_types(InvalidSessionIdException)
 
 
 STATUS_DOWNLOADING = "downloading"
@@ -17,6 +34,50 @@ STATUS_SKIPPED = "skipped"
 _INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp")
 
 MAX_RETRIES = 3
+_FORCED_SESSION_FAILURE_ENV = "IBIS_TEST_FORCE_SESSION_FAILURE_AFTER"
+
+
+class ControlledSessionFailureInjector:
+    """Development-only, one-shot session-failure hook for live validation.
+
+    This is intentionally enabled only by the private environment variable
+    ``IBIS_TEST_FORCE_SESSION_FAILURE_AFTER``.  It is not an application
+    setting and must never be used as part of normal production operation.
+    """
+
+    def __init__(self, after_completed: int | None = None):
+        self.after_completed = after_completed
+        self.triggered = False
+
+    @classmethod
+    def from_environment(cls, environ=None):
+        """Create a disabled injector unless the environment contains a positive integer."""
+        environ = os.environ if environ is None else environ
+        raw_value = environ.get(_FORCED_SESSION_FAILURE_ENV)
+        try:
+            after_completed = int(raw_value) if raw_value is not None else None
+        except (TypeError, ValueError):
+            after_completed = None
+        if after_completed is not None and after_completed < 1:
+            after_completed = None
+        return cls(after_completed)
+
+    @property
+    def enabled(self) -> bool:
+        return self.after_completed is not None
+
+    def raise_if_due(self, completed_count: int) -> None:
+        """Raise one real Selenium session exception when the configured point is reached."""
+        if not self.enabled or self.triggered or completed_count < self.after_completed:
+            return
+        self.triggered = True
+        logger.warning(
+            "TEST ONLY: injecting Selenium session failure after %d completed invoice.",
+            completed_count,
+        )
+        raise InvalidSessionIdException(
+            "Controlled validation fault: simulated Selenium session failure"
+        )
 
 
 @dataclass
@@ -25,6 +86,8 @@ class DownloadSummary:
     completed: int = 0
     failed: int = 0
     retried: int = 0
+    retry_attempts: int = 0
+    permanent_failures: int = 0
     skipped: int = 0
 
 
@@ -56,13 +119,20 @@ class DuplicateFileError(DownloadError):
     """Raised when the file has already been downloaded (not retryable)."""
 
 
+register_temporary_error_types(
+    DownloadTimeoutError,
+    IncompleteDownloadError,
+    TemporaryBrowserError,
+)
+
+
 def is_retryable(exc):
     """Return True if *exc* represents a transient failure that warrants a retry."""
-    return isinstance(exc, (DownloadTimeoutError, IncompleteDownloadError, TemporaryBrowserError))
+    return classify_error(exc) is ErrorCategory.TEMPORARY
 
 
 class DownloaderEngine:
-    def __init__(self, driver, *, download_dir=None, timeout=None, poll_interval=0.2, state_manager=None, download_state=None):
+    def __init__(self, driver, *, download_dir=None, timeout=None, poll_interval=0.2, state_manager=None, download_state=None, sleep_fn=None, fault_injector=None):
         self.driver = driver
         self.download_dir = Path(download_dir) if download_dir is not None else get_download_dir()
         if timeout is None:
@@ -73,6 +143,10 @@ class DownloaderEngine:
         self.poll_interval = poll_interval
         self.state_manager = state_manager
         self.download_state = download_state
+        self.sleep_fn = sleep_fn or time.sleep
+        # Controlled validation only.  AutoRecovery shares this one object
+        # with recovered engines so a single application run injects once.
+        self.fault_injector = fault_injector or ControlledSessionFailureInjector.from_environment()
         self.summary = DownloadSummary()
 
     def run(self, plan):
@@ -84,7 +158,9 @@ class DownloaderEngine:
             self.timeout,
             self.poll_interval,
         )
-        if self.download_state is not None:
+        if self.download_state is not None and not getattr(
+            self, "preserve_existing_state", False
+        ):
             self.download_state.initialize(plan.scheduled_items)
         started_at = time.monotonic()
         for item in plan.scheduled_items:
@@ -107,6 +183,7 @@ class DownloaderEngine:
                     item.download_url,
                     len(existing_files),
                 )
+                self.fault_injector.raise_if_due(self.summary.completed)
                 self.driver.get(item.download_url)
                 logger.info("Browser navigation completed; waiting for download file.")
                 downloaded_file = self._wait_for_download(existing_files)
@@ -135,26 +212,38 @@ class DownloaderEngine:
 
             except Exception as exc:
                 item.last_error = str(exc)
+                category = classify_error(exc)
                 logger.exception(
-                    "Download attempt %d/%d failed: invoice_id=%s, url=%s.",
+                    "Download attempt %d/%d failed: invoice_id=%s, category=%s, url=%s.",
                     attempt + 1,
                     MAX_RETRIES + 1,
                     item.invoice_id,
+                    category.value,
                     item.download_url,
                 )
-                if not is_retryable(exc) or attempt == MAX_RETRIES:
-                    logger.error(
-                        "Download will not be retried: invoice_id=%s, retryable=%s.",
+                if category is ErrorCategory.SESSION:
+                    logger.warning(
+                        "Session failure delegated to AutoRecovery: invoice_id=%s.",
                         item.invoice_id,
-                        is_retryable(exc),
                     )
+                    raise
+                if category is ErrorCategory.PERMANENT:
+                    self.summary.permanent_failures += 1
+                    logger.error("Permanent download failure: invoice_id=%s.", item.invoice_id)
+                    break
+                if attempt == MAX_RETRIES:
+                    logger.error("Temporary retries exhausted: invoice_id=%s.", item.invoice_id)
                     break
                 item.retry_count += 1
+                self.summary.retry_attempts += 1
+                delay = backoff_seconds(item.retry_count)
                 logger.warning(
-                    "Retrying download: invoice_id=%s, retry_count=%d.",
+                    "Retrying download: invoice_id=%s, retry_count=%d, backoff=%ss.",
                     item.invoice_id,
                     item.retry_count,
+                    delay,
                 )
+                self.sleep_fn(delay)
 
         self._finalize_item(item, STATUS_FAILED)
 
@@ -190,18 +279,28 @@ class DownloaderEngine:
                         downloaded_file,
                         current_size,
                     )
-            time.sleep(self.poll_interval)
+            self.sleep_fn(self.poll_interval)
 
         logger.warning("Timed out waiting for a stable completed download after %s seconds.", self.timeout)
         return None
 
     def _find_new_completed_file(self, existing_files):
         current_files = self._snapshot_files()
-        for file_path in sorted(
-            current_files - existing_files,
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        ):
+        candidates = []
+        for file_path in current_files - existing_files:
+            try:
+                candidates.append((file_path.stat().st_mtime, file_path))
+            except FileNotFoundError:
+                # Chrome can atomically rename/remove its .crdownload file
+                # between directory enumeration and stat().  This is a normal
+                # download-completion race, not a permanent download failure.
+                logger.debug("Temporary download file disappeared during inspection: %s", file_path)
+                continue
+            except OSError:
+                logger.debug("Could not inspect download candidate; continuing to poll: %s", file_path)
+                continue
+
+        for _, file_path in sorted(candidates, reverse=True):
             if file_path.suffix.lower() in _INCOMPLETE_SUFFIXES:
                 logger.debug("Ignoring temporary download file: %s", file_path)
                 continue
@@ -316,5 +415,7 @@ class DownloaderEngine:
         print(f"Completed: {self.summary.completed}")
         print(f"Failed: {self.summary.failed}")
         print(f"Retried: {self.summary.retried}")
+        print(f"Retry Attempts: {self.summary.retry_attempts}")
+        print(f"Permanent Failures: {self.summary.permanent_failures}")
         print(f"Skipped: {self.summary.skipped}")
         print(f"Elapsed: {elapsed_seconds:.1f} s")

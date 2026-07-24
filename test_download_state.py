@@ -12,6 +12,20 @@ from ibis.downloader_engine import (
 )
 from ibis.scheduler import DownloadPlan
 from ibis.state import DownloadState
+from ibis.state_manager import StateManager
+
+
+_sleep_patcher = None
+
+
+def setUpModule():
+    global _sleep_patcher
+    _sleep_patcher = patch("ibis.downloader_engine.time.sleep", return_value=None)
+    _sleep_patcher.start()
+
+
+def tearDownModule():
+    _sleep_patcher.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +292,84 @@ class TestDownloadStateMarkCompletedFailed(unittest.TestCase):
 
         self.assertEqual(len(loaded["completed"]), 1)
         self.assertEqual(len(loaded["failed"]), 1)
+
+    def test_failed_item_recovered_to_completed_cleans_stale_state(self):
+        with TemporaryDirectory() as tmp:
+            ds = DownloadState(state_file=Path(tmp) / "state.json")
+            original = _make_item("RECOVER1")
+            ds.initialize([original])
+            original.download_status = STATUS_FAILED
+            original.last_error = "browser disconnected"
+            ds.mark_failed(original)
+
+            recovered = _make_item("RECOVER1")
+            recovered.download_status = STATUS_COMPLETED
+            recovered.filename = "202605_RECOVER1.xls"
+            ds.mark_completed(recovered)
+            loaded = ds.load_state()
+
+        self.assertEqual(loaded["queue"][0]["download_status"], STATUS_COMPLETED)
+        self.assertEqual(loaded["queue"][0]["filename"], "202605_RECOVER1.xls")
+        self.assertEqual(loaded["failed"], [])
+        self.assertEqual(len(loaded["completed"]), 1)
+        self.assertEqual(loaded["completed"][0]["invoice_id"], "RECOVER1")
+
+    def test_downloading_item_recovered_to_completed_cleans_stale_queue_status(self):
+        with TemporaryDirectory() as tmp:
+            ds = DownloadState(state_file=Path(tmp) / "state.json")
+            original = _make_item("RECOVER2")
+            ds.initialize([original])
+            original.download_status = "downloading"
+            ds.save_state()
+
+            recovered = _make_item("RECOVER2")
+            recovered.download_status = STATUS_COMPLETED
+            recovered.filename = "202605_RECOVER2.xls"
+            ds.mark_completed(recovered)
+            loaded = ds.load_state()
+
+        self.assertEqual(loaded["queue"][0]["download_status"], STATUS_COMPLETED)
+        self.assertEqual(loaded["failed"], [])
+        self.assertEqual(loaded["completed"][0]["filename"], "202605_RECOVER2.xls")
+
+    def test_repeated_completion_does_not_duplicate_completed_records(self):
+        with TemporaryDirectory() as tmp:
+            ds = DownloadState(state_file=Path(tmp) / "state.json")
+            item = _make_item("RECOVER3")
+            ds.initialize([item])
+            item.download_status = STATUS_COMPLETED
+            item.filename = "first.xls"
+            ds.mark_completed(item)
+
+            recovered = _make_item("RECOVER3")
+            recovered.download_status = STATUS_COMPLETED
+            recovered.filename = "final.xls"
+            ds.mark_completed(recovered)
+            loaded = ds.load_state()
+
+        self.assertEqual(len(loaded["completed"]), 1)
+        self.assertEqual(loaded["completed"][0]["filename"], "final.xls")
+
+    def test_completed_invoice_record_stays_deduplicated_after_recovery_completion(self):
+        with TemporaryDirectory() as tmp:
+            download_dir = Path(tmp) / "downloads"
+            download_dir.mkdir()
+            (download_dir / "202605_RECOVER4.xls").write_text("export", encoding="utf-8")
+            manager = StateManager(
+                Path(tmp) / "completed_invoices.json", download_dir=download_dir
+            )
+            recovered = _make_item("RECOVER4")
+            recovered.download_status = STATUS_COMPLETED
+            recovered.filename = "202605_RECOVER4.xls"
+
+            manager.mark_completed(recovered)
+            manager.mark_completed(recovered)
+            state = json.loads(manager.state_file.read_text(encoding="utf-8"))
+
+        entries = state["completed_invoices"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["invoice_id"], "RECOVER4")
+        self.assertEqual(entries[0]["filename"], "202605_RECOVER4.xls")
 
 
 class TestDownloadStateItemSerialization(unittest.TestCase):
