@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 REPORT_SCHEMA_VERSION = "1.0"
+RUN_STATUSES = ("completed", "completed_with_failures", "failed")
 INVOICE_FIELDS = (
     "billing_period",
     "invoice_id",
@@ -39,7 +40,9 @@ class RunReporter:
 
     def generate(self, run_id, *, start_time, end_time, selected_billing_periods,
                  invoices_discovered, queued, completed, skipped, retry_attempts,
-                 successful_recoveries, permanent_failures, invoices):
+                 successful_recoveries, permanent_failures, invoices,
+                 run_status="completed", failure_stage=None, error_type=None,
+                 error_message=None):
         """Write all report formats and return their paths plus the document.
 
         ``invoices`` may contain dictionaries or queue/state objects.  Missing
@@ -60,6 +63,10 @@ class RunReporter:
             successful_recoveries=successful_recoveries,
             permanent_failures=permanent_failures,
             invoices=invoices,
+            run_status=run_status,
+            failure_stage=failure_stage,
+            error_type=error_type,
+            error_message=error_message,
         )
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         paths = {
@@ -75,11 +82,14 @@ class RunReporter:
     def build_document(self, *, run_id, start_time, end_time,
                        selected_billing_periods, invoices_discovered, queued,
                        completed, skipped, retry_attempts, successful_recoveries,
-                       permanent_failures, invoices):
+                       permanent_failures, invoices, run_status="completed",
+                       failure_stage=None, error_type=None, error_message=None):
         """Build the versioned canonical report document without writing files."""
         start = self._normalise_datetime(start_time)
         end = self._normalise_datetime(end_time)
         elapsed_seconds = max(0.0, round((end - start).total_seconds(), 3))
+        if run_status not in RUN_STATUSES:
+            raise ValueError(f"unsupported run_status: {run_status}")
         return {
             "schema_version": REPORT_SCHEMA_VERSION,
             "run_id": str(run_id),
@@ -87,6 +97,10 @@ class RunReporter:
             "start_time": start.isoformat(),
             "end_time": end.isoformat(),
             "elapsed_seconds": elapsed_seconds,
+            "run_status": run_status,
+            "failure_stage": self._nullable_text(failure_stage),
+            "error_type": self._nullable_text(error_type),
+            "error_message": self._nullable_text(error_message),
             "selected_billing_periods": list(selected_billing_periods or []),
             "invoices_discovered": self._count(invoices_discovered),
             "queued": self._count(queued),
@@ -101,6 +115,10 @@ class RunReporter:
     @staticmethod
     def _count(value):
         return value if isinstance(value, int) and value >= 0 else 0
+
+    @staticmethod
+    def _nullable_text(value):
+        return None if value is None else str(value)
 
     @staticmethod
     def _safe_run_id(run_id):
@@ -153,6 +171,7 @@ class RunReporter:
     def _write_csv(path, document):
         summary_fields = (
             "run_id", "start_time", "end_time", "elapsed_seconds",
+            "run_status", "failure_stage", "error_type", "error_message",
             "selected_billing_periods", "invoices_discovered", "queued",
             "completed", "skipped", "retry_attempts", "successful_recoveries",
             "permanent_failures",

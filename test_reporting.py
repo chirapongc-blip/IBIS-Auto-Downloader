@@ -66,6 +66,10 @@ class RunReporterTests(unittest.TestCase):
         self.assertEqual(document["schema_version"], REPORT_SCHEMA_VERSION)
         self.assertEqual(document["run_id"], "run-001")
         self.assertEqual(document["elapsed_seconds"], 12.345)
+        self.assertEqual(document["run_status"], "completed")
+        self.assertIsNone(document["failure_stage"])
+        self.assertIsNone(document["error_type"])
+        self.assertIsNone(document["error_message"])
         self.assertEqual(document["selected_billing_periods"], ["202605", "202604"])
         self.assertEqual(document["invoices_discovered"], 3)
         self.assertEqual(document["queued"], 2)
@@ -87,6 +91,7 @@ class RunReporterTests(unittest.TestCase):
         self.assertEqual(rows[0]["selected_billing_periods"], "202605,202604")
         self.assertEqual(rows[1]["invoice_id"], "100")
         self.assertEqual(rows[1]["recovered"], "True")
+        self.assertEqual(rows[0]["run_status"], "completed")
 
     def test_html_contains_summary_invoice_table_totals_and_timestamp(self):
         result = self._generate()
@@ -95,7 +100,38 @@ class RunReporterTests(unittest.TestCase):
         self.assertIn("IBIS Run Summary", page)
         self.assertIn("2026-07-24T12:01:00+00:00", page)
         self.assertIn("Invoice Id", page)
+        self.assertIn("Run Status", page)
         self.assertIn("Totals: discovered 3, queued 2, completed 1, skipped 1.", page)
+
+    def test_failure_status_and_metadata_render_in_all_formats(self):
+        result = self.reporter.generate(
+            "failed-run",
+            start_time=self.start,
+            end_time=self.end,
+            selected_billing_periods=["202605"],
+            invoices_discovered=1,
+            queued=1,
+            completed=0,
+            skipped=0,
+            retry_attempts=0,
+            successful_recoveries=0,
+            permanent_failures=0,
+            invoices=[],
+            run_status="failed",
+            failure_stage="download",
+            error_type="RuntimeError",
+            error_message="controlled failure",
+        )
+        document = json.loads(result["json"].read_text(encoding="utf-8"))
+        csv_text = result["csv"].read_text(encoding="utf-8")
+        html_text = result["html"].read_text(encoding="utf-8")
+
+        self.assertEqual(document["run_status"], "failed")
+        self.assertEqual(document["failure_stage"], "download")
+        self.assertEqual(document["error_type"], "RuntimeError")
+        self.assertEqual(document["error_message"], "controlled failure")
+        self.assertIn("failed", csv_text)
+        self.assertIn("controlled failure", html_text)
 
     def test_invalid_run_id_cannot_escape_reports_directory(self):
         with self.assertRaises(ValueError):
