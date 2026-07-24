@@ -30,6 +30,7 @@ from ibis.state import DownloadState
 from ibis.state_manager import StateManager
 from ibis.billing_period import BillingPeriodManager, BillingPeriodNotFoundError
 from ibis.reporting import RunReporter
+from ibis.performance import PerformanceTracker
 from logger import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -249,9 +250,11 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
 
     logger.info("Starting download workflow.")
     started_at = datetime.now(timezone.utc)
-    ds = DownloadState()
-    saved_state = ds.load_state()
-    resuming = has_interrupted_session(saved_state)
+    performance = PerformanceTracker()
+    with performance.stage("state_loading"):
+        ds = DownloadState()
+        saved_state = ds.load_state()
+        resuming = has_interrupted_session(saved_state)
 
     driver = None
     # _initial_driver is consumed by AutoRecovery on its first run; if an
@@ -272,108 +275,113 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
     failure_stage = "initialization"
 
     try:
-        driver = create_driver()
-        _initial_driver.append(driver)
+        with performance.stage("browser_startup"):
+            driver = create_driver()
+            _initial_driver.append(driver)
         failure_stage = "authentication"
-        driver.get(BASE_URL)
-
-        print("请在浏览器完成登录...")
-        wait_until_logged_in(driver)
+        with performance.stage("authentication"):
+            driver.get(BASE_URL)
+            print("请在浏览器完成登录...")
+            wait_until_logged_in(driver)
 
         print("登录成功。")
 
         if resuming:
-            failure_stage = "resume"
-            print("Resuming interrupted download session...")
-            selected_periods = _resolve_resume_periods(saved_state, billing_period_selection)
-            # A dry run reads the snapshot but never rewrites it, including
-            # avoiding a legacy-session migration during preview generation.
-            if not dry_run:
-                ds.restore(saved_state, selected_periods=selected_periods)
-                ds.save_state()
-            queue = build_resume_queue(saved_state, periods=selected_periods)
-            latest_billing_period = max(selected_periods) if selected_periods else None
-            already_completed_count = len(saved_state.get("completed", []))
-            found_count = sum(
-                1
-                for item in saved_state.get("queue", [])
-                if item.get("billing_period") in selected_periods
-            )
-            report_items = [
-                item for item in saved_state.get("queue", [])
-                if item.get("billing_period") in selected_periods
-            ]
+            with performance.stage("resume"):
+                failure_stage = "resume"
+                print("Resuming interrupted download session...")
+                selected_periods = _resolve_resume_periods(saved_state, billing_period_selection)
+                # A dry run reads the snapshot but never rewrites it, including
+                # avoiding a legacy-session migration during preview generation.
+                if not dry_run:
+                    ds.restore(saved_state, selected_periods=selected_periods)
+                    ds.save_state()
+                queue = build_resume_queue(saved_state, periods=selected_periods)
+                latest_billing_period = max(selected_periods) if selected_periods else None
+                already_completed_count = len(saved_state.get("completed", []))
+                found_count = sum(
+                    1
+                    for item in saved_state.get("queue", [])
+                    if item.get("billing_period") in selected_periods
+                )
+                report_items = [
+                    item for item in saved_state.get("queue", [])
+                    if item.get("billing_period") in selected_periods
+                ]
         else:
-            failure_stage = "discovery"
-            print("正在打开 Invoice 页面...")
+            with performance.stage("invoice_discovery"):
+                failure_stage = "discovery"
+                print("正在打开 Invoice 页面...")
 
-            html = open_invoice_page(driver)
+                html = open_invoice_page(driver)
 
-            if not dry_run:
-                with open("invoice_page.html", "w", encoding="utf-8") as f:
-                    f.write(html)
+                if not dry_run:
+                    with open("invoice_page.html", "w", encoding="utf-8") as f:
+                        f.write(html)
 
-            wait_for_grid(driver)
+                wait_for_grid(driver)
 
-            anchors = driver.find_elements(
-                By.CSS_SELECTOR,
-                "a[href*='DownloadARExport.aspx']"
-            )
-
-            print("Selenium found:", len(anchors))
-
-            for a in anchors[:5]:
-                print(a.get_attribute("href"))
-
-            html2 = driver.page_source
-
-            if not dry_run:
-                with open("invoice_after_wait.html", "w", encoding="utf-8") as f:
-                    f.write(html2)
-
-            print("After wait:", html2.count("DownloadARExport.aspx"))
-            print("Pager info:", get_devexpress_pager_info(html2))
-
-            print(f"Grid TR 数量：{count_grid_rows(driver)}")
-            print("\n========== Grid Preview ==========")
-            print(get_grid_text(driver)[:1000])
-            print("==================================\n")
-
-            all_links = collect_grid_download_links(driver, BASE_URL)
-            period_manager = BillingPeriodManager(driver, base_url=BASE_URL, links=all_links)
-            selected_periods = _resolve_available_periods(
-                period_manager, billing_period_selection
-            )
-            selected_links = _filter_links_for_periods(all_links, selected_periods)
-            if len(selected_periods) <= 1 and not dry_run:
-                queue_result = build_download_queue(
-                    selected_links, state_manager=state_manager
+                anchors = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "a[href*='DownloadARExport.aspx']"
                 )
-            else:
-                queue_result = _build_selected_queue(
-                    all_links, state_manager, selected_periods, read_only=dry_run
+
+                print("Selenium found:", len(anchors))
+
+                for a in anchors[:5]:
+                    print(a.get_attribute("href"))
+
+                html2 = driver.page_source
+
+                if not dry_run:
+                    with open("invoice_after_wait.html", "w", encoding="utf-8") as f:
+                        f.write(html2)
+
+                print("After wait:", html2.count("DownloadARExport.aspx"))
+                print("Pager info:", get_devexpress_pager_info(html2))
+
+                print(f"Grid TR 数量：{count_grid_rows(driver)}")
+                print("\n========== Grid Preview ==========")
+                print(get_grid_text(driver)[:1000])
+                print("==================================\n")
+
+                all_links = collect_grid_download_links(driver, BASE_URL, grid_ready=True)
+                period_manager = BillingPeriodManager(driver, base_url=BASE_URL, links=all_links)
+                selected_periods = _resolve_available_periods(
+                    period_manager, billing_period_selection
                 )
-            queue = queue_result.queue
-            latest_billing_period = queue_result.latest_billing_period
-            found_count = queue_result.found_count
-            already_completed_count = queue_result.already_completed_count
-            ds.selected_periods = selected_periods
-            report_items = selected_links
-            skipped_keys = {
-                _item_key(link) for link in selected_links
-            } - {_item_key(item) for item in queue}
+                selected_links = _filter_links_for_periods(all_links, selected_periods)
+                if len(selected_periods) <= 1 and not dry_run:
+                    queue_result = build_download_queue(
+                        selected_links, state_manager=state_manager
+                    )
+                else:
+                    queue_result = _build_selected_queue(
+                        all_links, state_manager, selected_periods, read_only=dry_run
+                    )
+                queue = queue_result.queue
+                latest_billing_period = queue_result.latest_billing_period
+                found_count = queue_result.found_count
+                already_completed_count = queue_result.already_completed_count
+                ds.selected_periods = selected_periods
+                report_items = selected_links
+                skipped_keys = {
+                    _item_key(link) for link in selected_links
+                } - {_item_key(item) for item in queue}
 
         print(f"Found invoices: {found_count}")
         print(f"Already completed: {already_completed_count}")
         print(f"Download Queue: {len(queue)}")
 
-        plan = DownloadPlan(queue, latest_only=False)
+        with performance.stage("queue_planning"):
+            plan = DownloadPlan(queue, latest_only=False)
         print(f"下载计划已建立，共 {plan.scheduled_count} 个项目。")
 
         if dry_run:
-            _print_dry_run_preview(
-                plan, selected_periods, found_count, already_completed_count
-            )
+            with performance.stage("dry_run_preview"):
+                _print_dry_run_preview(
+                    plan, selected_periods, found_count, already_completed_count
+                )
             failure_stage = None
             return
 
@@ -416,7 +424,8 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
             download_state=ds,
             engine_factory=_engine_factory,
         )
-        recovery_summary = ar.run(plan)
+        with performance.stage("download_execution"):
+            recovery_summary = ar.run(plan)
 
         engine = last_engine[0]
         if recovery_summary is not None:
@@ -458,30 +467,31 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
         else:
             run_status = "completed"
         try:
-            final_state = ds.load_state()
-            report_result = RunReporter().generate(
-                run_id or "unknown-run",
-                start_time=started_at,
-                end_time=datetime.now(timezone.utc),
-                selected_billing_periods=selected_periods,
-                invoices_discovered=found_count,
-                queued=len(queue),
-                completed=completed_count,
-                skipped=already_completed_count,
-                retry_attempts=getattr(recovery_summary, "retry_attempts", 0),
-                successful_recoveries=getattr(recovery_summary, "successful_recoveries", 0),
-                permanent_failures=permanent_failure_count,
-                invoices=_report_invoice_details(
-                    report_items, final_state, skipped_keys, recovered_keys,
+            with performance.stage("report_generation"):
+                final_state = ds.load_state()
+                report_result = RunReporter().generate(
+                    run_id or "unknown-run",
+                    start_time=started_at,
+                    end_time=datetime.now(timezone.utc),
+                    selected_billing_periods=selected_periods,
+                    invoices_discovered=found_count,
+                    queued=len(queue),
+                    completed=completed_count,
+                    skipped=already_completed_count,
+                    retry_attempts=getattr(recovery_summary, "retry_attempts", 0),
+                    successful_recoveries=getattr(recovery_summary, "successful_recoveries", 0),
+                    permanent_failures=permanent_failure_count,
+                    invoices=_report_invoice_details(
+                        report_items, final_state, skipped_keys, recovered_keys,
+                        dry_run=dry_run,
+                        queued_keys={_item_key(item) for item in queue},
+                    ),
+                    run_status=run_status,
+                    failure_stage=failure_stage if workflow_error is not None else None,
+                    error_type=type(workflow_error).__name__ if workflow_error else None,
+                    error_message=str(workflow_error) if workflow_error else None,
                     dry_run=dry_run,
-                    queued_keys={_item_key(item) for item in queue},
-                ),
-                run_status=run_status,
-                failure_stage=failure_stage if workflow_error is not None else None,
-                error_type=type(workflow_error).__name__ if workflow_error else None,
-                error_message=str(workflow_error) if workflow_error else None,
-                dry_run=dry_run,
-            )
+                )
             logger.info("Run report generated: %s", report_result["json"])
         except Exception:
             logger.exception("Run report generation failed.")
@@ -490,8 +500,11 @@ def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=Fa
         # AutoRecovery quits its own driver when run() returns or raises.
         # Only quit here if AutoRecovery never consumed the initial driver
         # (i.e. an exception occurred before ar.run() was reached).
-        if _initial_driver and driver is not None:
-            driver.quit()
+        try:
+            if _initial_driver and driver is not None:
+                driver.quit()
+        finally:
+            performance.print_summary()
 
 
 def main(argv=None):
