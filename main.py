@@ -62,6 +62,11 @@ def parse_cli_args(argv=None):
         metavar="YYYYMM[,YYYYMM]|latest|all",
         help="Billing period selection; defaults to the latest available period.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the selected download queue without downloading or changing state.",
+    )
     return parser.parse_args([] if argv is None else argv)
 
 
@@ -74,10 +79,12 @@ def _filter_links_for_periods(links, selected_periods):
     ]
 
 
-def _build_selected_queue(links, state_manager, selected_periods):
+def _build_selected_queue(links, state_manager, selected_periods, *, read_only=False):
     """Filter links before queue construction without changing downloader logic."""
     selected_links = _filter_links_for_periods(links, selected_periods)
-    pending_links, already_completed_count = state_manager.filter_pending_links(selected_links)
+    pending_links, already_completed_count = state_manager.filter_pending_links(
+        selected_links, read_only=read_only
+    )
     latest = max(selected_periods) if selected_periods else None
     return SimpleNamespace(
         queue=DownloadQueue.from_links(pending_links),
@@ -152,7 +159,8 @@ def _item_key(item):
     return invoice_id, billing_period
 
 
-def _report_invoice_details(items, state, skipped_keys, recovered_keys):
+def _report_invoice_details(items, state, skipped_keys, recovered_keys, *, dry_run=False,
+                            queued_keys=None):
     """Build report records from the final state without changing downloads."""
     state = state if isinstance(state, dict) else {}
     completed = {_item_key(item): item for item in state.get("completed", [])}
@@ -162,7 +170,9 @@ def _report_invoice_details(items, state, skipped_keys, recovered_keys):
         invoice_id, billing_period = _item_key(item)
         key = invoice_id, billing_period
         final_item = completed.get(key) or failed.get(key) or item
-        if key in completed:
+        if dry_run:
+            status = "would_download" if key in (queued_keys or set()) else "skipped"
+        elif key in completed:
             status = "completed"
         elif key in failed:
             status = "failed"
@@ -196,7 +206,40 @@ def _report_invoice_details(items, state, skipped_keys, recovered_keys):
     return details
 
 
-def _download_workflow(billing_period_selection=None, *, run_id=None):
+def _preview_filename(item):
+    """Describe the filename without guessing or changing its extension."""
+    filename = item.get("filename") if isinstance(item, dict) else getattr(item, "filename", None)
+    if filename:
+        return filename
+    invoice_id, billing_period = _item_key(item)
+    if invoice_id and billing_period:
+        return f"{billing_period}_{invoice_id} (server extension)"
+    return "server-provided filename"
+
+
+def _print_dry_run_preview(plan, selected_periods, found_count, already_completed_count):
+    """Print a human-readable, side-effect-free queue preview."""
+    from collections import Counter
+
+    grouped = Counter(item.billing_period for item in plan.scheduled_items)
+    print("\n========== DRY RUN PREVIEW ==========")
+    print(f"Selected billing periods: {', '.join(selected_periods) or 'none'}")
+    print(f"Invoices discovered: {found_count}")
+    print(f"Already completed / skipped: {already_completed_count}")
+    print(f"Invoices that would be queued: {plan.scheduled_count}")
+    print("Queue by billing period:")
+    for period in sorted(grouped, reverse=True):
+        print(f"  {period}: {grouped[period]}")
+    for item in plan.scheduled_items:
+        print(
+            f"  Invoice {item.invoice_id} | period {item.billing_period} | "
+            f"expected filename: {_preview_filename(item)}"
+        )
+    print("DRY RUN — no files were downloaded")
+    print("=====================================\n")
+
+
+def _download_workflow(billing_period_selection=None, *, run_id=None, dry_run=False):
     """Execute the full Build 2.5 download workflow (one pass).
 
     If ``state/download_state.json`` records an interrupted session the
@@ -243,8 +286,11 @@ def _download_workflow(billing_period_selection=None, *, run_id=None):
             failure_stage = "resume"
             print("Resuming interrupted download session...")
             selected_periods = _resolve_resume_periods(saved_state, billing_period_selection)
-            ds.restore(saved_state, selected_periods=selected_periods)
-            ds.save_state()
+            # A dry run reads the snapshot but never rewrites it, including
+            # avoiding a legacy-session migration during preview generation.
+            if not dry_run:
+                ds.restore(saved_state, selected_periods=selected_periods)
+                ds.save_state()
             queue = build_resume_queue(saved_state, periods=selected_periods)
             latest_billing_period = max(selected_periods) if selected_periods else None
             already_completed_count = len(saved_state.get("completed", []))
@@ -263,8 +309,9 @@ def _download_workflow(billing_period_selection=None, *, run_id=None):
 
             html = open_invoice_page(driver)
 
-            with open("invoice_page.html", "w", encoding="utf-8") as f:
-                f.write(html)
+            if not dry_run:
+                with open("invoice_page.html", "w", encoding="utf-8") as f:
+                    f.write(html)
 
             wait_for_grid(driver)
 
@@ -280,8 +327,9 @@ def _download_workflow(billing_period_selection=None, *, run_id=None):
 
             html2 = driver.page_source
 
-            with open("invoice_after_wait.html", "w", encoding="utf-8") as f:
-                f.write(html2)
+            if not dry_run:
+                with open("invoice_after_wait.html", "w", encoding="utf-8") as f:
+                    f.write(html2)
 
             print("After wait:", html2.count("DownloadARExport.aspx"))
             print("Pager info:", get_devexpress_pager_info(html2))
@@ -297,13 +345,13 @@ def _download_workflow(billing_period_selection=None, *, run_id=None):
                 period_manager, billing_period_selection
             )
             selected_links = _filter_links_for_periods(all_links, selected_periods)
-            if len(selected_periods) <= 1:
+            if len(selected_periods) <= 1 and not dry_run:
                 queue_result = build_download_queue(
                     selected_links, state_manager=state_manager
                 )
             else:
                 queue_result = _build_selected_queue(
-                    all_links, state_manager, selected_periods
+                    all_links, state_manager, selected_periods, read_only=dry_run
                 )
             queue = queue_result.queue
             latest_billing_period = queue_result.latest_billing_period
@@ -321,6 +369,13 @@ def _download_workflow(billing_period_selection=None, *, run_id=None):
 
         plan = DownloadPlan(queue, latest_only=False)
         print(f"下载计划已建立，共 {plan.scheduled_count} 个项目。")
+
+        if dry_run:
+            _print_dry_run_preview(
+                plan, selected_periods, found_count, already_completed_count
+            )
+            failure_stage = None
+            return
 
         period_tracker = PeriodTracker()
         current_period = latest_billing_period or plan.latest_billing_period
@@ -417,12 +472,15 @@ def _download_workflow(billing_period_selection=None, *, run_id=None):
                 successful_recoveries=getattr(recovery_summary, "successful_recoveries", 0),
                 permanent_failures=permanent_failure_count,
                 invoices=_report_invoice_details(
-                    report_items, final_state, skipped_keys, recovered_keys
+                    report_items, final_state, skipped_keys, recovered_keys,
+                    dry_run=dry_run,
+                    queued_keys={_item_key(item) for item in queue},
                 ),
                 run_status=run_status,
                 failure_stage=failure_stage if workflow_error is not None else None,
                 error_type=type(workflow_error).__name__ if workflow_error else None,
                 error_message=str(workflow_error) if workflow_error else None,
+                dry_run=dry_run,
             )
             logger.info("Run report generated: %s", report_result["json"])
         except Exception:
@@ -442,13 +500,17 @@ def main(argv=None):
     logger.info("Starting IBIS Auto Downloader version %s (run %s).", VERSION, run_id)
     if not SCHEDULER_ENABLED:
         # Build 2.6 behaviour: run once and exit.
-        scheduler = Scheduler(lambda: _download_workflow(args.billing_period, run_id=run_id))
+        scheduler = Scheduler(lambda: _download_workflow(
+            args.billing_period, run_id=run_id, dry_run=args.dry_run
+        ))
         scheduler.run_once()
         return
 
     # Build 2.7: use configurable schedule.
     scheduler = Scheduler(
-        lambda: _download_workflow(args.billing_period, run_id=run_id),
+        lambda: _download_workflow(
+            args.billing_period, run_id=run_id, dry_run=args.dry_run
+        ),
         mode=SCHEDULER_MODE,
         schedule_day=SCHEDULE_DAY,
         schedule_hour=SCHEDULE_HOUR,

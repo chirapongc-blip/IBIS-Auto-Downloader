@@ -15,7 +15,13 @@ class StateManager:
         self.state_file = Path(state_file) if state_file is not None else STATE_DIR / "completed_invoices.json"
         self.download_dir = Path(download_dir) if download_dir is not None else None
 
-    def filter_pending_links(self, links):
+    def filter_pending_links(self, links, *, read_only=False):
+        """Return pending links, optionally without migrating legacy state.
+
+        ``read_only`` is used by the dry-run preview.  It preserves the same
+        verification decisions while guaranteeing completed-state JSON is not
+        written as a side effect of a legacy record upgrade.
+        """
         state = self._load_state()
         completed_entries = {
             (entry.get("invoice_id"), entry.get("billing_period")): entry
@@ -74,7 +80,7 @@ class StateManager:
                 migrated = True
             already_completed_count += 1
 
-        if migrated:
+        if migrated and not read_only:
             self._save_state(state)
 
         return pending_links, already_completed_count

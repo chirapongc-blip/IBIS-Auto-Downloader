@@ -163,6 +163,84 @@ class BillingPeriodMainFlowIntegrationTests(unittest.TestCase):
             self._run_main(["--billing-period", "20260"])
 
 
+class BillingPeriodDryRunFixtureIntegrationTests(unittest.TestCase):
+    """Run the complete dry-run discovery path against captured grid pages."""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def _run_dry(self, period=None):
+        state_dir = Path(self.temp_dir.name)
+        driver = FixtureGridDriver()
+        reporter = MagicMock()
+        args = ["--dry-run"]
+        if period is not None:
+            args.extend(["--billing-period", period])
+        with patch("main.create_driver", return_value=driver), \
+             patch("main.wait_until_logged_in") as login, \
+             patch("main.open_invoice_page", return_value=driver.page_source), \
+             patch("main.wait_for_grid"), \
+             patch("ibis.grid_walker.wait_for_grid"), \
+             patch("ibis.grid_walker.WebDriverWait", ImmediateWait), \
+             patch("main.count_grid_rows", return_value=5), \
+             patch("main.get_grid_text", return_value="fixture grid"), \
+             patch("main.get_devexpress_pager_info", return_value={}), \
+             patch("main.StateManager", side_effect=lambda: StateManager(
+                 state_file=state_dir / "completed.json",
+                 download_dir=state_dir / "downloads",
+             )), \
+             patch("main.DownloadState", side_effect=lambda: DownloadState(
+                 state_file=state_dir / "download_state.json"
+             )), \
+             patch("main.PeriodTracker"), \
+             patch("main.AutoRecovery") as recovery, \
+             patch("main.DownloaderEngine") as engine, \
+             patch("main.RunReporter", return_value=reporter), \
+             patch("main.configure_logging", return_value="fixture-dry-run"):
+            main.main(args)
+        _, report = reporter.generate.call_args
+        self.assertTrue(report["dry_run"])
+        self.assertEqual(report["run_status"], "completed")
+        login.assert_called_once_with(driver)
+        recovery.assert_not_called()
+        engine.assert_not_called()
+        self.assertTrue(driver.quit_called)
+        self.assertFalse((state_dir / "download_state.json").exists())
+        self.assertFalse((state_dir / "completed.json").exists())
+        return report
+
+    def test_default_and_explicit_latest_preview_only_fixture_latest(self):
+        default = self._run_dry()
+        explicit = self._run_dry("latest")
+        self.assertEqual(default["selected_billing_periods"], ["202605"])
+        self.assertEqual(default["queued"], 2)
+        self.assertEqual(
+            [(item["invoice_id"], item["billing_period"]) for item in default["invoices"]],
+            [(item["invoice_id"], item["billing_period"]) for item in explicit["invoices"]],
+        )
+
+    def test_multiple_and_all_preview_fixture_period_scopes(self):
+        multi = self._run_dry("202605,202604")
+        self.assertEqual(multi["selected_billing_periods"], ["202605", "202604"])
+        self.assertEqual(_period_counts_from_report(multi), {"202605": 2, "202604": 2})
+        self.assertIn(("700", "202605"), _report_keys(multi))
+        self.assertIn(("700", "202604"), _report_keys(multi))
+
+        all_periods = self._run_dry("all")
+        self.assertEqual(_period_counts_from_report(all_periods), {
+            "202605": 2, "202604": 2, "202603": 1,
+        })
+
+
+def _period_counts_from_report(report):
+    return Counter(item["billing_period"] for item in report["invoices"])
+
+
+def _report_keys(report):
+    return {(item["invoice_id"], item["billing_period"]) for item in report["invoices"]}
+
+
 class BillingPeriodRecoveryScopeIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = TemporaryDirectory()
