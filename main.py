@@ -1,4 +1,8 @@
+import argparse
 import logging
+import re
+import sys
+from types import SimpleNamespace
 from config import (
     BASE_URL,
     VERSION,
@@ -12,7 +16,7 @@ from selenium.webdriver.common.by import By
 
 from ibis.auto_recovery import AutoRecovery
 from ibis.browser import create_driver
-from ibis.downloader import build_download_queue
+from ibis.downloader import DownloadQueue, extract_link_metadata, build_download_queue
 from ibis.downloader_engine import DownloaderEngine
 from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_info
 from ibis.invoice import open_invoice_page
@@ -23,12 +27,116 @@ from ibis.scheduler import DownloadPlan, Scheduler
 from ibis.period_tracker import PeriodTracker
 from ibis.state import DownloadState
 from ibis.state_manager import StateManager
+from ibis.billing_period import BillingPeriodManager, BillingPeriodNotFoundError
 from logger import configure_logging
 
 logger = logging.getLogger(__name__)
 
+_PERIOD_RE = re.compile(r"^\d{6}$")
 
-def _download_workflow():
+
+def normalize_billing_periods(value):
+    """Normalize a CLI billing-period value into a mode or unique periods."""
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in {"latest", "all"}:
+        return text
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part or not _PERIOD_RE.fullmatch(part) for part in parts):
+        raise argparse.ArgumentTypeError(
+            "billing periods must be YYYYMM values separated by commas, 'latest', or 'all'"
+        )
+    return tuple(dict.fromkeys(parts))
+
+
+def parse_cli_args(argv=None):
+    parser = argparse.ArgumentParser(description="IBIS Auto Downloader")
+    parser.add_argument(
+        "--billing-period",
+        type=normalize_billing_periods,
+        default=None,
+        metavar="YYYYMM[,YYYYMM]|latest|all",
+        help="Billing period selection; defaults to the latest available period.",
+    )
+    return parser.parse_args([] if argv is None else argv)
+
+
+def _filter_links_for_periods(links, selected_periods):
+    selected = set(selected_periods)
+    return [
+        link
+        for link in links
+        if extract_link_metadata(link)[1] in selected
+    ]
+
+
+def _build_selected_queue(links, state_manager, selected_periods):
+    """Filter links before queue construction without changing downloader logic."""
+    selected_links = _filter_links_for_periods(links, selected_periods)
+    pending_links, already_completed_count = state_manager.filter_pending_links(selected_links)
+    latest = max(selected_periods) if selected_periods else None
+    return SimpleNamespace(
+        queue=DownloadQueue.from_links(pending_links),
+        found_count=len(selected_links),
+        already_completed_count=already_completed_count,
+        latest_billing_period=latest,
+    )
+
+
+def _resolve_available_periods(manager, selection):
+    available = manager.get_periods()
+    if selection in (None, "latest"):
+        latest = manager.latest()
+        return [latest] if latest is not None else []
+    if selection == "all":
+        return available
+    try:
+        for period in selection:
+            manager.select(period)
+    except BillingPeriodNotFoundError as exc:
+        raise ValueError(str(exc)) from exc
+    return [period for period in available if period in selection]
+
+
+def _state_periods(state):
+    selected = state.get("selected_periods")
+    if selected is not None:
+        return sorted(set(selected), reverse=True)
+    return sorted(
+        {
+            item.get("billing_period")
+            for item in state.get("queue", [])
+            if item.get("billing_period") is not None
+        },
+        reverse=True,
+    )
+
+
+def _resolve_resume_periods(state, selection):
+    available = _state_periods(state)
+    if selection is None:
+        selected = (
+            state["selected_periods"]
+            if state.get("selected_periods") is not None
+            else (available[:1] if available else [])
+        )
+        return list(selected)
+    if selection == "latest":
+        return available[:1]
+    if selection == "all":
+        return available
+    missing = [period for period in selection if period not in available]
+    if missing:
+        choices = ", ".join(available) or "none"
+        raise ValueError(
+            f"Billing period '{missing[0]}' does not exist in the resumable session. "
+            f"Available periods: {choices}."
+        )
+    return [period for period in available if period in selection]
+
+
+def _download_workflow(billing_period_selection=None):
     """Execute the full Build 2.5 download workflow (one pass).
 
     If ``state/download_state.json`` records an interrupted session the
@@ -57,10 +165,17 @@ def _download_workflow():
 
         if resuming:
             print("Resuming interrupted download session...")
-            queue = build_resume_queue(saved_state)
-            latest_billing_period = saved_state.get("billing_period")
+            selected_periods = _resolve_resume_periods(saved_state, billing_period_selection)
+            ds.restore(saved_state, selected_periods=selected_periods)
+            ds.save_state()
+            queue = build_resume_queue(saved_state, periods=selected_periods)
+            latest_billing_period = max(selected_periods) if selected_periods else None
             already_completed_count = len(saved_state.get("completed", []))
-            found_count = len(saved_state.get("queue", []))
+            found_count = sum(
+                1
+                for item in saved_state.get("queue", [])
+                if item.get("billing_period") in selected_periods
+            )
         else:
             print("正在打开 Invoice 页面...")
 
@@ -95,11 +210,24 @@ def _download_workflow():
             print("==================================\n")
 
             all_links = collect_grid_download_links(driver, BASE_URL)
-            queue_result = build_download_queue(all_links, state_manager=state_manager)
+            period_manager = BillingPeriodManager(driver, base_url=BASE_URL, links=all_links)
+            selected_periods = _resolve_available_periods(
+                period_manager, billing_period_selection
+            )
+            if len(selected_periods) <= 1:
+                selected_links = _filter_links_for_periods(all_links, selected_periods)
+                queue_result = build_download_queue(
+                    selected_links, state_manager=state_manager
+                )
+            else:
+                queue_result = _build_selected_queue(
+                    all_links, state_manager, selected_periods
+                )
             queue = queue_result.queue
             latest_billing_period = queue_result.latest_billing_period
             found_count = queue_result.found_count
             already_completed_count = queue_result.already_completed_count
+            ds.selected_periods = selected_periods
 
         print(f"Found invoices: {found_count}")
         print(f"Already completed: {already_completed_count}")
@@ -116,6 +244,8 @@ def _download_workflow():
 
         def _engine_factory(d):
             e = DownloaderEngine(d, state_manager=state_manager, download_state=ds)
+            if resuming:
+                e.preserve_existing_state = True
             last_engine[0] = e
             return e
 
@@ -157,18 +287,19 @@ def _download_workflow():
             driver.quit()
 
 
-def main():
+def main(argv=None):
+    args = parse_cli_args(argv)
     run_id = configure_logging()
     logger.info("Starting IBIS Auto Downloader version %s (run %s).", VERSION, run_id)
     if not SCHEDULER_ENABLED:
         # Build 2.6 behaviour: run once and exit.
-        scheduler = Scheduler(_download_workflow)
+        scheduler = Scheduler(lambda: _download_workflow(args.billing_period))
         scheduler.run_once()
         return
 
     # Build 2.7: use configurable schedule.
     scheduler = Scheduler(
-        _download_workflow,
+        lambda: _download_workflow(args.billing_period),
         mode=SCHEDULER_MODE,
         schedule_day=SCHEDULE_DAY,
         schedule_hour=SCHEDULE_HOUR,
@@ -189,4 +320,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
