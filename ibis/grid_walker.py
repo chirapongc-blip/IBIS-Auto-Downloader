@@ -59,7 +59,8 @@ def get_devexpress_pager_info(html: str, grid_id: str = GRID_ID):
 
 
 def collect_grid_download_links(
-    driver, base_url: str, grid_id: str = GRID_ID, timeout: int = 30
+    driver, base_url: str, grid_id: str = GRID_ID, timeout: int = 30,
+    *, grid_ready: bool = False,
 ):
     """
     Walk every page of the DevExpress grid and return all DownloadARExport links.
@@ -69,7 +70,11 @@ def collect_grid_download_links(
 
     Returns a list of dicts: [{"url": "...", "title": "..."}]
     """
-    wait_for_grid(driver, timeout)
+    # The main workflow already waits before its diagnostic grid inspection.
+    # Avoid a duplicate explicit wait in that known-ready path; the public
+    # default remains unchanged for all other callers.
+    if not grid_ready:
+        wait_for_grid(driver, timeout)
 
     links = []
     seen_urls = set()

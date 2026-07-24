@@ -165,6 +165,7 @@ class TestMainFlowIntegration(unittest.TestCase):
         self.assertIn("Found invoices: 1", output)
         self.assertIn("Already completed: 1", output)
         self.assertIn("Download Queue: 0", output)
+        self.assertIn("Performance Summary", output)
 
     def test_last_period_saved_when_all_downloads_succeed(self):
         result = self._run_main(

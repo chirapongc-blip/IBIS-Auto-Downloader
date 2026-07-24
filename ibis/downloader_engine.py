@@ -144,6 +144,7 @@ class DownloaderEngine:
         self.state_manager = state_manager
         self.download_state = download_state
         self.sleep_fn = sleep_fn or time.sleep
+        self._download_dir_ready = False
         # Controlled validation only.  AutoRecovery shares this one object
         # with recovered engines so a single application run injects once.
         self.fault_injector = fault_injector or ControlledSessionFailureInjector.from_environment()
@@ -380,8 +381,18 @@ class DownloaderEngine:
             counter += 1
 
     def _snapshot_files(self):
-        self.download_dir.mkdir(parents=True, exist_ok=True)
-        return {path for path in self.download_dir.iterdir() if path.is_file()}
+        # Polling can execute hundreds of times per download.  Creating an
+        # already-existing directory on every iteration is needless I/O.  If
+        # another process removes it, recover exactly as the former code did.
+        if not self._download_dir_ready:
+            self.download_dir.mkdir(parents=True, exist_ok=True)
+            self._download_dir_ready = True
+        try:
+            entries = self.download_dir.iterdir()
+        except FileNotFoundError:
+            self.download_dir.mkdir(parents=True, exist_ok=True)
+            entries = self.download_dir.iterdir()
+        return {path for path in entries if path.is_file()}
 
     def _set_status(self, item, status):
         item.download_status = status
