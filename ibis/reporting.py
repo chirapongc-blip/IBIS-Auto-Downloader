@@ -42,7 +42,7 @@ class RunReporter:
                  invoices_discovered, queued, completed, skipped, retry_attempts,
                  successful_recoveries, permanent_failures, invoices,
                  run_status="completed", failure_stage=None, error_type=None,
-                 error_message=None):
+                 error_message=None, dry_run=False):
         """Write all report formats and return their paths plus the document.
 
         ``invoices`` may contain dictionaries or queue/state objects.  Missing
@@ -67,6 +67,7 @@ class RunReporter:
             failure_stage=failure_stage,
             error_type=error_type,
             error_message=error_message,
+            dry_run=dry_run,
         )
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         paths = {
@@ -83,7 +84,8 @@ class RunReporter:
                        selected_billing_periods, invoices_discovered, queued,
                        completed, skipped, retry_attempts, successful_recoveries,
                        permanent_failures, invoices, run_status="completed",
-                       failure_stage=None, error_type=None, error_message=None):
+                       failure_stage=None, error_type=None, error_message=None,
+                       dry_run=False):
         """Build the versioned canonical report document without writing files."""
         start = self._normalise_datetime(start_time)
         end = self._normalise_datetime(end_time)
@@ -101,6 +103,7 @@ class RunReporter:
             "failure_stage": self._nullable_text(failure_stage),
             "error_type": self._nullable_text(error_type),
             "error_message": self._nullable_text(error_message),
+            "dry_run": bool(dry_run),
             "selected_billing_periods": list(selected_billing_periods or []),
             "invoices_discovered": self._count(invoices_discovered),
             "queued": self._count(queued),
@@ -172,6 +175,7 @@ class RunReporter:
         summary_fields = (
             "run_id", "start_time", "end_time", "elapsed_seconds",
             "run_status", "failure_stage", "error_type", "error_message",
+            "dry_run",
             "selected_billing_periods", "invoices_discovered", "queued",
             "completed", "skipped", "retry_attempts", "successful_recoveries",
             "permanent_failures",

@@ -92,7 +92,16 @@ def find_downloaded_output(filename, *, download_dir=None):
     if not filename:
         return None
 
-    directory = Path(download_dir) if download_dir is not None else get_download_dir()
+    # This is a lookup helper, including during dry-run and resume checks.
+    # Do not create the downloads directory merely to determine that an
+    # expected output is absent. Actual download execution still uses
+    # ``get_download_dir`` and creates it as before.
+    if download_dir is None:
+        from config import DOWNLOAD_DIR as configured_download_dir
+
+        directory = configured_download_dir
+    else:
+        directory = Path(download_dir)
     name = Path(filename).name
     if name != filename:
         return None
