@@ -23,6 +23,19 @@ from ibis.downloader_engine import (
 from ibis.scheduler import DownloadPlan
 
 
+_sleep_patcher = None
+
+
+def setUpModule():
+    global _sleep_patcher
+    _sleep_patcher = patch("ibis.downloader_engine.time.sleep", return_value=None)
+    _sleep_patcher.start()
+
+
+def tearDownModule():
+    _sleep_patcher.stop()
+
+
 class FakeDriver:
     def __init__(self, download_dir: Path, file_by_url=None):
         self.download_dir = download_dir

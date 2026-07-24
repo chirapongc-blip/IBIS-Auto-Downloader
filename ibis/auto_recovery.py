@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
+from config import BASE_URL
 from ibis.recovery import CrashRecoveryHandler
 from ibis.retry import ErrorCategory, classify_error
 from ibis.resume import build_resume_queue, has_interrupted_session
@@ -96,7 +97,7 @@ class AutoRecovery:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, plan: DownloadPlan) -> None:
+    def run(self, plan: DownloadPlan) -> RecoverySummary:
         """Run *plan* with automatic recovery on browser/session failure.
 
         Executes the engine and, on each browser failure, performs up to
@@ -113,22 +114,36 @@ class AutoRecovery:
         current_plan = plan
         attempt = 0
         self.summary = RecoverySummary()
+        self._recorded_engines: set[int] = set()
+        recovered_workflow_pending = False
 
         while True:
+            engine = None
             try:
                 engine = self.engine_factory(driver)
+                if recovered_workflow_pending:
+                    # Keep the original DownloadState queue and completed
+                    # history intact while the remaining plan is processed.
+                    engine.preserve_existing_state = True
                 engine.run(current_plan)
                 self._record_engine_summary(engine)
+                if recovered_workflow_pending:
+                    self.summary.successful_recoveries += 1
+                    logger.info(
+                        "Recovered workflow completed successfully: count=%d.",
+                        self.summary.successful_recoveries,
+                    )
                 # Successful completion – quit driver and return.
                 self._quit_driver(driver)
                 return self.summary
 
             except Exception as exc:
+                self._record_engine_summary(engine)
                 if classify_error(exc) is not ErrorCategory.SESSION:
+                    logger.exception("Recovery workflow terminated by a non-session failure.")
+                    self._log_final_summary()
                     self._quit_driver(driver)
                     raise
-
-                self._record_engine_summary(engine)
 
                 attempt += 1
                 logger.warning(
@@ -143,21 +158,28 @@ class AutoRecovery:
                 self.recovery_handler.handle(exc)
 
                 if attempt >= self.max_attempts:
-                    logger.error(
+                    logger.exception(
                         "Maximum recovery attempts (%d) reached. Giving up.",
                         self.max_attempts,
                     )
+                    self._log_final_summary()
                     self._quit_driver(driver)
                     raise
 
-                # Attempt recovery: new driver → login → invoice page → resume.
-                driver = self._recover(driver)
-                current_plan = self._rebuild_plan()
-                self.summary.successful_recoveries += 1
-                logger.info(
-                    "Automatic recovery succeeded: count=%d.",
-                    self.summary.successful_recoveries,
-                )
+                # Attempt recovery: new driver → IBIS → manual login → invoice
+                # page → resume. Each stage owns cleanup of the replacement.
+                replacement_driver = None
+                try:
+                    replacement_driver = self._recover(driver)
+                    current_plan = self._rebuild_plan()
+                except Exception:
+                    self._quit_driver(replacement_driver)
+                    logger.exception("Recovery setup failed; replacement driver was closed.")
+                    self._log_final_summary()
+                    raise
+
+                driver = replacement_driver
+                recovered_workflow_pending = True
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -174,15 +196,19 @@ class AutoRecovery:
         self._quit_driver(old_driver)
 
         logger.info("Creating new WebDriver for recovery.")
-        new_driver = self.driver_factory()
-
-        logger.info("Waiting for user to log in again.")
-        self.login_fn(new_driver)
-
-        logger.info("Reopening Invoice page.")
-        self.open_invoice_fn(new_driver)
-
-        return new_driver
+        new_driver = None
+        try:
+            new_driver = self.driver_factory()
+            logger.info("Browser reopened; navigating to IBIS for manual login.")
+            new_driver.get(BASE_URL)
+            logger.info("Waiting for the user to complete manual IBIS login.")
+            self.login_fn(new_driver)
+            logger.info("Reopening Invoice page after manual login.")
+            self.open_invoice_fn(new_driver)
+            return new_driver
+        except Exception:
+            self._quit_driver(new_driver)
+            raise
 
     def _rebuild_plan(self) -> DownloadPlan:
         """Reload saved state and return a :class:`DownloadPlan` for remaining items."""
@@ -198,9 +224,24 @@ class AutoRecovery:
 
     def _record_engine_summary(self, engine) -> None:
         """Accumulate metrics from an engine run, including aborted runs."""
+        if engine is None or id(engine) in self._recorded_engines:
+            return
+        self._recorded_engines.add(id(engine))
         engine_summary = getattr(engine, "summary", None)
-        self.summary.retry_attempts += getattr(engine_summary, "retry_attempts", 0)
-        self.summary.permanent_failures += getattr(engine_summary, "permanent_failures", 0)
+        retry_attempts = getattr(engine_summary, "retry_attempts", 0)
+        permanent_failures = getattr(engine_summary, "permanent_failures", 0)
+        self.summary.retry_attempts += retry_attempts if isinstance(retry_attempts, int) else 0
+        self.summary.permanent_failures += (
+            permanent_failures if isinstance(permanent_failures, int) else 0
+        )
+
+    def _log_final_summary(self) -> None:
+        logger.error(
+            "Final retry/recovery summary: retry_attempts=%d, successful_recoveries=%d, permanent_failures=%d.",
+            self.summary.retry_attempts,
+            self.summary.successful_recoveries,
+            self.summary.permanent_failures,
+        )
 
     @staticmethod
     def _quit_driver(driver) -> None:

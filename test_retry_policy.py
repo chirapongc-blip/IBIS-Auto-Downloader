@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from selenium.common.exceptions import WebDriverException
 from ibis.auto_recovery import AutoRecovery
 from ibis.downloader import DownloadQueue
 from ibis.downloader_engine import (
@@ -12,10 +13,6 @@ from ibis.downloader_engine import (
 )
 from ibis.retry import ErrorCategory, backoff_seconds, classify_error
 from ibis.scheduler import DownloadPlan
-
-
-class WebDriverException(Exception):
-    pass
 
 
 class _FlakyDriver:
@@ -31,6 +28,9 @@ class _FlakyDriver:
 
 
 class _NoopDriver:
+    def get(self, _url):
+        pass
+
     def quit(self):
         pass
 

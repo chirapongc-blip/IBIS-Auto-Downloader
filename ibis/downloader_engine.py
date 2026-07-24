@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ibis.downloader import get_download_dir, STATUS_PENDING
-from ibis.retry import ErrorCategory, backoff_seconds, classify_error
+from ibis.retry import (
+    ErrorCategory,
+    backoff_seconds,
+    classify_error,
+    register_temporary_error_types,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,13 @@ class DuplicateFileError(DownloadError):
     """Raised when the file has already been downloaded (not retryable)."""
 
 
+register_temporary_error_types(
+    DownloadTimeoutError,
+    IncompleteDownloadError,
+    TemporaryBrowserError,
+)
+
+
 def is_retryable(exc):
     """Return True if *exc* represents a transient failure that warrants a retry."""
     return classify_error(exc) is ErrorCategory.TEMPORARY
@@ -88,7 +100,9 @@ class DownloaderEngine:
             self.timeout,
             self.poll_interval,
         )
-        if self.download_state is not None:
+        if self.download_state is not None and not getattr(
+            self, "preserve_existing_state", False
+        ):
             self.download_state.initialize(plan.scheduled_items)
         started_at = time.monotonic()
         for item in plan.scheduled_items:

@@ -13,20 +13,39 @@ class ErrorCategory(str, Enum):
 
 BACKOFF_SECONDS = (1, 2, 5)
 
-_SESSION_EXCEPTION_NAMES = frozenset(
-    {"WebDriverException", "InvalidSessionIdException", "NoSuchWindowException"}
-)
-_TEMPORARY_EXCEPTION_NAMES = frozenset(
-    {"DownloadTimeoutError", "IncompleteDownloadError", "TemporaryBrowserError"}
-)
+try:  # Selenium is optional in lightweight unit-test environments.
+    from selenium.common.exceptions import (
+        InvalidSessionIdException,
+        NoSuchWindowException,
+        WebDriverException,
+    )
+
+    _SESSION_ERROR_TYPES = (
+        WebDriverException,
+        InvalidSessionIdException,
+        NoSuchWindowException,
+    )
+except ImportError:  # pragma: no cover - exercised only without Selenium
+    _SESSION_ERROR_TYPES = ()
+
+_TEMPORARY_ERROR_TYPES: tuple[type[BaseException], ...] = ()
+
+
+def register_temporary_error_types(*error_types: type[BaseException]) -> None:
+    """Register downloader-owned temporary exception classes.
+
+    The downloader defines these classes, so registration avoids a circular
+    import while retaining explicit ``isinstance`` classification.
+    """
+    global _TEMPORARY_ERROR_TYPES
+    _TEMPORARY_ERROR_TYPES = tuple(dict.fromkeys((*_TEMPORARY_ERROR_TYPES, *error_types)))
 
 
 def classify_error(exc: BaseException) -> ErrorCategory:
     """Classify *exc* for retry and session-recovery decisions."""
-    exception_names = {cls.__name__ for cls in type(exc).__mro__}
-    if exception_names & _SESSION_EXCEPTION_NAMES:
+    if _SESSION_ERROR_TYPES and isinstance(exc, _SESSION_ERROR_TYPES):
         return ErrorCategory.SESSION
-    if exception_names & _TEMPORARY_EXCEPTION_NAMES or isinstance(
+    if isinstance(exc, _TEMPORARY_ERROR_TYPES) or isinstance(
         exc, (TimeoutError, ConnectionError)
     ):
         return ErrorCategory.TEMPORARY

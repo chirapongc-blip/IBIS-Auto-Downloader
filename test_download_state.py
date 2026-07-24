@@ -14,6 +14,19 @@ from ibis.scheduler import DownloadPlan
 from ibis.state import DownloadState
 
 
+_sleep_patcher = None
+
+
+def setUpModule():
+    global _sleep_patcher
+    _sleep_patcher = patch("ibis.downloader_engine.time.sleep", return_value=None)
+    _sleep_patcher.start()
+
+
+def tearDownModule():
+    _sleep_patcher.stop()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
