@@ -22,7 +22,7 @@ def _link():
 
 class CliVersioningTests(unittest.TestCase):
     def test_authoritative_version_is_used_by_the_application(self):
-        self.assertEqual(__version__, "3.5.0-beta1")
+        self.assertEqual(__version__, "3.6.0-beta1")
         self.assertEqual(APPLICATION_NAME, "IBIS Auto Downloader")
 
     def test_version_exits_before_logging_or_browser_initialization(self):
@@ -33,7 +33,7 @@ class CliVersioningTests(unittest.TestCase):
              patch("main.RunReporter") as reporter, \
              redirect_stdout(output):
             main.main(["--version"])
-        self.assertEqual(output.getvalue().strip(), "IBIS Auto Downloader 3.5.0-beta1")
+        self.assertEqual(output.getvalue().strip(), "IBIS Auto Downloader 3.6.0-beta1")
         configure.assert_not_called()
         create_driver.assert_not_called()
         state.assert_not_called()
@@ -45,13 +45,72 @@ class CliVersioningTests(unittest.TestCase):
              patch("main.Scheduler", return_value=scheduler), \
              patch("main.logger") as logger:
             main.main([])
-        logger.info.assert_called_once_with(
+        logger.info.assert_any_call(
             "Starting %s version %s (run %s).",
             APPLICATION_NAME,
             __version__,
             "run-1",
         )
+        logger.info.assert_any_call(
+            "Runtime metadata: python=%s, platform=%s, download_dir=%s, report_dir=%s.",
+            main.sys.version.split()[0],
+            main.platform.platform(),
+            main.DOWNLOAD_DIR.resolve(),
+            (main.PROJECT_ROOT / "reports").resolve(),
+        )
         scheduler.run_once.assert_called_once()
+
+    def test_show_config_exits_before_logging_or_browser_initialization(self):
+        output = io.StringIO()
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            download_dir = root / "not-created-downloads"
+            report_dir = root / "not-created-reports"
+            with patch("main.configure_logging") as configure, \
+                 patch("main.create_driver") as create_driver, \
+                 patch("main.DownloadState") as state, \
+                 patch("main.RunReporter") as reporter, \
+                 patch("main.platform.platform", return_value="Test OS"), \
+                 patch("main.sys.version", "3.12.0 test build"), \
+                 redirect_stdout(output):
+                main.main([
+                    "--show-config",
+                    "--download-dir", str(download_dir),
+                    "--report-dir", str(report_dir),
+                ])
+            text = output.getvalue()
+            self.assertIn("IBIS Auto Downloader 3.6.0-beta1", text)
+            self.assertIn("Application version: 3.6.0-beta1", text)
+            self.assertIn("Python version: 3.12.0", text)
+            self.assertIn("Operating system: Test OS", text)
+            self.assertIn(f"Download directory: {download_dir.resolve()}", text)
+            self.assertIn(f"Report directory: {report_dir.resolve()}", text)
+            self.assertIn(f"State directory: {main.STATE_DIR.resolve()}", text)
+            self.assertIn("Billing Period mode: latest (default)", text)
+            self.assertIn("Retry count: 3", text)
+            self.assertIn("Dry Run default: false", text)
+            self.assertIn("Performance instrumentation status: enabled", text)
+            self.assertFalse(download_dir.exists())
+            self.assertFalse(report_dir.exists())
+        configure.assert_not_called()
+        create_driver.assert_not_called()
+        state.assert_not_called()
+        reporter.assert_not_called()
+
+    def test_help_includes_practical_examples(self):
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as raised, redirect_stdout(output):
+            main.parse_cli_args(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        text = output.getvalue()
+        for example in (
+            "python3 main.py --version",
+            "python3 main.py --show-config",
+            "python3 main.py --dry-run",
+            "python3 main.py --download-dir ~/Downloads",
+            "python3 main.py --report-dir ~/Reports",
+        ):
+            self.assertIn(example, text)
 
     def test_directory_arguments_resolve_and_expand_home(self):
         args = main.parse_cli_args([
