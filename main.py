@@ -1,5 +1,6 @@
 import argparse
 import logging
+import platform
 import re
 import sys
 from datetime import datetime, timezone
@@ -7,18 +8,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from config import (
     BASE_URL,
+    DOWNLOAD_DIR,
+    PROJECT_ROOT,
     SCHEDULER_ENABLED,
     SCHEDULER_MODE,
     SCHEDULE_DAY,
     SCHEDULE_HOUR,
     SCHEDULE_MINUTE,
+    STATE_DIR,
 )
 from selenium.webdriver.common.by import By
 
 from ibis.auto_recovery import AutoRecovery
 from ibis.browser import create_driver
 from ibis.downloader import DownloadQueue, extract_link_metadata, build_download_queue
-from ibis.downloader_engine import DownloaderEngine
+from ibis.downloader_engine import DownloaderEngine, MAX_RETRIES
 from ibis.grid_walker import collect_grid_download_links, get_devexpress_pager_info
 from ibis.invoice import open_invoice_page
 from ibis.grid import wait_for_grid, get_grid_text, count_grid_rows
@@ -38,6 +42,41 @@ logger = logging.getLogger(__name__)
 _DOWNLOADER_ENGINE_TYPE = DownloaderEngine
 
 _PERIOD_RE = re.compile(r"^\d{6}$")
+
+
+def _resolved_run_directories(download_dir=None, report_dir=None):
+    """Return display-safe resolved paths without creating any directories."""
+    download_path = download_dir if download_dir is not None else DOWNLOAD_DIR
+    report_path = report_dir if report_dir is not None else PROJECT_ROOT / "reports"
+    return Path(download_path).expanduser().resolve(), Path(report_path).expanduser().resolve()
+
+
+def _billing_period_mode(selection):
+    """Describe the CLI selection without accessing the Invoice page."""
+    if selection is None:
+        return "latest (default)"
+    if isinstance(selection, tuple):
+        return ", ".join(selection)
+    return selection
+
+
+def _show_config(args):
+    """Print the static, read-only runtime configuration and exit."""
+    download_dir, report_dir = _resolved_run_directories(args.download_dir, args.report_dir)
+    lines = (
+        f"{APPLICATION_NAME} {__version__}",
+        f"Application version: {__version__}",
+        f"Python version: {sys.version.split()[0]}",
+        f"Operating system: {platform.platform()}",
+        f"Download directory: {download_dir}",
+        f"Report directory: {report_dir}",
+        f"State directory: {Path(STATE_DIR).expanduser().resolve()}",
+        f"Billing Period mode: {_billing_period_mode(args.billing_period)}",
+        f"Retry count: {MAX_RETRIES}",
+        "Dry Run default: false",
+        "Performance instrumentation status: enabled",
+    )
+    print("\n".join(lines))
 
 
 def normalize_billing_periods(value):
@@ -61,7 +100,18 @@ def resolve_cli_directory(value):
 
 
 def parse_cli_args(argv=None):
-    parser = argparse.ArgumentParser(description="IBIS Auto Downloader")
+    parser = argparse.ArgumentParser(
+        description="IBIS Auto Downloader",
+        epilog=(
+            "Examples:\n"
+            "  python3 main.py --version\n"
+            "  python3 main.py --show-config\n"
+            "  python3 main.py --dry-run\n"
+            "  python3 main.py --download-dir ~/Downloads\n"
+            "  python3 main.py --report-dir ~/Reports"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--billing-period",
         type=normalize_billing_periods,
@@ -78,6 +128,11 @@ def parse_cli_args(argv=None):
         "--version",
         action="store_true",
         help="Print the application version and exit.",
+    )
+    parser.add_argument(
+        "--show-config",
+        action="store_true",
+        help="Print read-only runtime configuration and exit.",
     )
     parser.add_argument(
         "--download-dir",
@@ -549,8 +604,19 @@ def main(argv=None):
     if args.version:
         print(f"{APPLICATION_NAME} {__version__}")
         return
+    if args.show_config:
+        _show_config(args)
+        return
     run_id = configure_logging()
     logger.info("Starting %s version %s (run %s).", APPLICATION_NAME, __version__, run_id)
+    download_dir, report_dir = _resolved_run_directories(args.download_dir, args.report_dir)
+    logger.info(
+        "Runtime metadata: python=%s, platform=%s, download_dir=%s, report_dir=%s.",
+        sys.version.split()[0],
+        platform.platform(),
+        download_dir,
+        report_dir,
+    )
     if not SCHEDULER_ENABLED:
         # Build 2.6 behaviour: run once and exit.
         scheduler = Scheduler(lambda: _download_workflow(
